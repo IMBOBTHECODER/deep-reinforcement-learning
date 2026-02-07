@@ -6,6 +6,7 @@ import os
 import psutil
 import GPUtil
 from numba import jit
+from concurrent.futures import ThreadPoolExecutor
 from .entity import EntityBelief, init_single_creature, WorldModel
 from .physics import Quaternion, RigidBody, PhysicsEngine
 from config import Config
@@ -22,6 +23,20 @@ logger = logging.getLogger(__name__)
 
 # Precompute constants to avoid repeated computation in hot loops
 LOG_2PI = math.log(2.0 * math.pi)
+
+# ===== MULTI-THREADING POOL FOR PHYSICS ======
+# Auto-detect optimal thread count (avoid oversubscription)
+def _get_physics_thread_count():
+    """Determine optimal number of worker threads for physics."""
+    if Config.NUM_PHYSICS_THREADS is not None:
+        return Config.NUM_PHYSICS_THREADS
+    # Use all CPUs except 1 (reserved for main thread)
+    return max(1, os.cpu_count() - 1)
+
+physics_thread_pool = ThreadPoolExecutor(
+    max_workers=_get_physics_thread_count(),
+    thread_name_prefix="physics_worker"
+)
 
 # ===== JIT SIMULATION KERNEL (fused for maximum performance) =====
 @jit(nopython=True)
@@ -189,6 +204,37 @@ def simulation_step(
         obs_rel_x, obs_rel_y, obs_rel_z,
         obs_abs_x, obs_abs_y, obs_abs_z
     )
+
+
+def compute_reward_parallel(creatures, motor_torques_list, physics_engine, goal_pos):
+    """
+    Compute rewards for multiple creatures in parallel using ThreadPoolExecutor.
+    This distributes CPU-heavy physics calculations across multiple cores.
+    
+    Args:
+        creatures: list of creature objects
+        motor_torques_list: list of motor torque tensors
+        physics_engine: PhysicsEngine instance
+        goal_pos: goal position tensor
+    
+    Returns:
+        list of (reward, com_dist) tuples
+    """
+    def compute_single(creature, motor_torques):
+        reward, com_dist, _ = physics_engine._compute_reward(
+            creature, motor_torques, goal_pos
+        )
+        return reward, com_dist
+    
+    # Submit all tasks to thread pool
+    futures = [
+        physics_thread_pool.submit(compute_single, creature, torques)
+        for creature, torques in zip(creatures, motor_torques_list)
+    ]
+    
+    # Collect results
+    results = [f.result() for f in futures]
+    return results
 
 
 def detect_available_envs():
@@ -501,12 +547,32 @@ class TrainingEngine:
                     tanh_correction = -torch.log(1.0 - actions ** 2 + self.log_eps).sum(dim=1)
                     log_probs = log_prob_gaussian + tanh_correction
                     
-                    # Process results for each environment
+                    # Collect creatures and actions for parallel reward computation
+                    active_creatures = []
+                    active_actions = []
+                    active_rnn_states = []
+                    active_env_ids = []
                     env_id_active = 0
+                    
                     for env_id in range(num_envs):
                         if step_counts[env_id] < max_steps:
                             creature = self.env.creatures[env_id]
-                            
+                            motor_torques = actions[env_id_active:env_id_active+1][0] * 5.0
+                            active_creatures.append(creature)
+                            active_actions.append(motor_torques)
+                            active_rnn_states.append(creature.rnn_state)
+                            active_env_ids.append(env_id)
+                            env_id_active += 1
+                    
+                    # Compute rewards in parallel across CPU threads
+                    reward_results = compute_reward_parallel(
+                        active_creatures, active_actions, self.physics, self.env.goal_pos_t
+                    )
+                    
+                    # Process results for each environment
+                    env_id_active = 0
+                    for env_idx, (creature, env_id) in enumerate(zip(active_creatures, active_env_ids)):
+                        if step_counts[env_id] < max_steps:
                             # Extract results for this environment
                             mu_i = mu[env_id_active:env_id_active+1]
                             action_i = actions[env_id_active:env_id_active+1]
@@ -519,13 +585,8 @@ class TrainingEngine:
                                 new_c[env_id_active:env_id_active+1]
                             )
                             
-                            # Scale action to motor torques
-                            motor_torques = action_i[0] * 5.0
-                            
-                            # Compute reward
-                            reward, com_dist, _ = self.physics._compute_reward(
-                                creature, motor_torques, self.env.goal_pos_t
-                            )
+                            # Get pre-computed reward and distance
+                            reward, com_dist = reward_results[env_idx]
                             
                             # Check if done
                             done = float(com_dist) < self.physics.com_distance_threshold

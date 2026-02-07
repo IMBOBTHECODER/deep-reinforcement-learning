@@ -17,9 +17,10 @@ MAX_TRAINING_EPISODES = 100
 # Episodes before evaluation
 # Range: 10-500
 
-MAX_STEPS_PER_EPISODE = 500
+MAX_STEPS_PER_EPISODE = 1000
 # Steps per episode
-# Range: 100-2000
+# Range: 500-2000
+# Note: Reduced from 2000 for faster collection cycles
 
 LOAD_CHECKPOINT = True
 # Resume training from checkpoint
@@ -28,11 +29,16 @@ LOAD_CHECKPOINT = True
 ## Environment
 
 ```python
-# Vectorized parallel training
+# Vectorized parallel training (Feb 2026 optimizations)
 USE_VECTORIZED_ENV = True
-NUM_ENVS = None           # Auto-detect (2-16)
-MAX_ENVS = 16
+NUM_ENVS = None           # Auto-detect based on available memory
+MAX_ENVS = 64             # Increased for better multi-core physics parallelism
 MIN_ENVS = 2
+
+# Multi-threaded physics
+NUM_PHYSICS_THREADS = None  # Auto-detect (typically num_cpus - 1)
+                            # Distributes CPU-heavy physics across cores
+                            # Keeps GPU fed with more data
 
 # World layout
 DIM = (64, 32, 64)        # Width × Height × Depth
@@ -70,13 +76,22 @@ VALUE_COEF = 0.5          # Value loss weight (0.1-1.0)
 LR = 3e-4                 # Learning rate (1e-5 to 1e-3)
 ```
 
+## Training Stability (Feb 2026)
+
+```python
+GRAD_CLIP_NORM = 0.5      # Clip gradient norm to prevent explosion
+BATCH_SIZE = 32           # Smaller batches for more stable updates
+VALUE_CLIP_RANGE = 0.2    # Clip value function updates for stability
+```
+
 ## Physics Parameters (Critical)
 
 ### Joint Dynamics
 ```python
-JOINT_DAMPING = 0.01
-# Angular velocity damping
+JOINT_DAMPING = 0.1
+# Angular velocity damping (INCREASED for stability)
 # Higher = smoother, Lower = oscillatory
+# Changed from 0.05 to 0.1 for better control
 
 MAX_TORQUE = 5.0
 # Maximum motor torque (N·m)

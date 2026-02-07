@@ -8,7 +8,7 @@ class Config:
     
     # Core training parameters
     DIM = (64, 32, 64)  # World dimensions (larger for balance task)
-    MAX_STEPS_PER_EPISODE = 2000
+    MAX_STEPS_PER_EPISODE = 1000
     MAX_TRAINING_EPISODES = 50
     LOAD_CHECKPOINT = False
     CHECKPOINT_DIR = Path("checkpoint")
@@ -16,9 +16,9 @@ class Config:
     # ============ VECTORIZED MULTI-ENVIRONMENT TRAINING ============
     USE_VECTORIZED_ENV = True
     NUM_ENVS = None  # Auto-detect based on available memory
-    MAX_ENVS = 8
+    MAX_ENVS = 64
     MIN_ENVS = 2
-    MAX_DATA_THRESHOLD_MB = 2048
+    MAX_DATA_THRESHOLD_MB = 8192
     
     # Memory model updated for quadruped observation (37D)
     # Observation: (1, 37) float32 = 148 bytes per observation
@@ -56,6 +56,14 @@ class Config:
     VALUE_COEF = 0.5
     LR = 3e-4
     
+    # ============ TRAINING STABILITY ============
+    GRAD_CLIP_NORM = 0.5  # Prevent exploding gradients
+    VALUE_CLIP_RANGE = 0.2  # Clip value function updates
+    
+    # ============ MULTI-CORE PROCESSING ============
+    # Physics processing distributed across CPU cores
+    NUM_PHYSICS_THREADS = None  # None = auto-detect (typically num_cpus - 1)
+    
     # ============ BALANCE TASK REWARD SHAPING ============
     # Goal: Keep center of mass (COM) close to goal position
     # Reward = exp(-distance) + tilt_penalty + contact_reward - energy_cost
@@ -73,9 +81,9 @@ class Config:
     
     
     # ============ PHYSICS SYSTEM - QUADRUPED ============
-    # Joint dynamics: motor torques → joint accelerations → velocities → angles
+    # Physics parameters (tuned for stability)
     DT = 0.01  # Timestep: 100 Hz physics simulation
-    JOINT_DAMPING = 0.05  # Servo motor damping (realistic)
+    JOINT_DAMPING = 0.1  # Increased damping for smoother motion
     MAX_TORQUE = 5.0  # Maximum motor torque (N*m)
     SEGMENT_LENGTH = 0.1  # Length of each leg segment (3 segments = 0.3m leg)
     MAX_JOINT_VELOCITY = 10.0  # rad/s
