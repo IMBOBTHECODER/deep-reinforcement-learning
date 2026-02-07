@@ -50,7 +50,7 @@ def simulation_step(
     # Reward parameters
     prev_dist: float, goal_threshold: float, proximity_threshold: float,
     distance_reward_scale: float, proximity_bonus_scale: float, goal_bonus: float,
-    wall_penalty_scale: float, stamina_penalty: float
+    wall_penalty_scale: float
 ) -> tuple:
     """
     Complete simulation step kernel: movement, physics, reward, observation.
@@ -180,7 +180,7 @@ def simulation_step(
     proximity_reward = proximity_reached * (proximity_threshold - curr_dist) * proximity_bonus_scale
     
     # Total reward
-    reward = goal_reward + distance_reward + proximity_reward + wall_penalty + stamina_penalty
+    reward = goal_reward + distance_reward + proximity_reward + wall_penalty
     
     return (
         clamped_x, clamped_y, clamped_z,
@@ -299,25 +299,12 @@ class Environment:
     
     def observe(self, creature):
         """
-        Observation for quadruped in AGENT-CENTERED WORLD.
-        
-        Agent COM is always at origin. Goal position is relative to agent.
-        This simplifies learning since all observations are centered on the agent.
-        
-        Observation components (37D total):
-        - Joint angles (12): positions of all 12 joints
-        - Joint velocities (12): angular velocities
-        - Foot contact (4): contact state of each foot [0, 1]
-        - Orientation (3): pitch, yaw, roll (body tilt)
-        - Center of mass (3): COM position (relative to body, usually ~0)
-        - Goal relative (3): goal position - agent COM position (in agent-centered frame)
+        Observation for quadruped in AGENT-CENTERED WORLD (37D total).
+        See docs/QUADRUPED_BALANCE_TASK.md for component breakdown.
         
         Returns: (1, 37) tensor
         """
         from .entity import compute_center_of_mass
-        
-        # In agent-centered world, agent is at origin
-        # Goal position is already relative (goal_pos_t - creature.pos = goal - agent_com)
         
         obs_list = [
             creature.joint_angles,                                    # (12,)
@@ -341,13 +328,10 @@ class TrainingEngine:
         self.env = environment
         self.physics = physics_engine
         
-        # RL models - QUADRUPED (37D observation, 12D action for motor torques)
-        # WARNING: These are hardcoded here intentionally. Changing them requires editing simulate.py directly
-        # because they have LARGE consequences:
-        # - OBS_DIM=37 affects entity observations, rendering, evaluation visualization
-        # - ACTION_DIM=12 affects motor control, physics simulation, evaluation
-        NN_OBS_DIM = 37  # 12 angles + 12 velocities + 4 contacts + 3 orientation + 3 COM + 3 goal-rel
-        NN_NUM_ACTIONS = 12  # Motor torques for 4 legs × 3 joints
+        # RL models - QUADRUPED (37D observation, 12D motor torques)
+        # WARNING: OBS_DIM=37 and ACTION_DIM=12 are hardcoded; changes affect multiple modules
+        NN_OBS_DIM = 37
+        NN_NUM_ACTIONS = 12
         
         self.model = EntityBelief(
             obs_dim=NN_OBS_DIM,
@@ -434,6 +418,179 @@ class TrainingEngine:
         else:
             logger.info("No checkpoint found, starting fresh training")
     
+    def collect_trajectories_vectorized(self, max_steps=500):
+        """
+        Collect trajectories from ALL environments in parallel (batched).
+        Maintains separate RNN states, goals, and creatures per environment.
+        
+        Returns:
+            list of trajectories, one per environment
+        """
+        self.model.eval()
+        
+        num_envs = self.env.num_envs
+        batch_size = num_envs
+        
+        # Initialize trajectory list for each environment
+        trajectories = [[] for _ in range(num_envs)]
+        step_counts = [0] * num_envs
+        
+        # Reset all creatures
+        for env_id in range(num_envs):
+            creature = self.env.creatures[env_id]
+            creature.pos = torch.tensor([0.0, 0.0, 0.5], dtype=self.dtype, device=self.device)
+            creature.velocity = torch.zeros(3, dtype=self.dtype, device=self.device)
+            creature.orientation = torch.zeros(3, dtype=self.dtype, device=self.device)
+            creature.joint_angles = torch.tensor([0.3, 0.6, 0.3] * 4, dtype=self.dtype, device=self.device)
+            creature.joint_velocities = torch.zeros(12, dtype=self.dtype, device=self.device)
+            creature.foot_contact = torch.ones(4, dtype=self.dtype, device=self.device)
+            h0, c0 = self.model.init_state(1, self.device, self.dtype)
+            creature.rnn_state = (h0, c0)
+            self.env.spawn_random_goal(env_id)
+        
+        # Main loop: run all environments until they all reach max_steps
+        for global_step in range(max_steps):
+            # Collect observations from all environments
+            obs_list = []
+            for env_id in range(num_envs):
+                if step_counts[env_id] < max_steps:
+                    creature = self.env.creatures[env_id]
+                    obs = self.env.observe(creature)  # (1, 37)
+                    obs_list.append(obs)
+            
+            if not obs_list:
+                break  # All environments done
+            
+            # Stack into batch: (batch_size, 37)
+            obs_batch = torch.cat(obs_list, dim=0)  # (num_active_envs, 37)
+            
+            # Get actions from model for all environments
+            with torch.no_grad():
+                # NOTE: This assumes model can handle variable batch sizes
+                # If model doesn't support this, we may need to pad to fixed size
+                try:
+                    # Try batch processing
+                    edge_idx = self.env.edge_indices[0]  # Use first env's edge index (should be same for all)
+                    
+                    # Get RNN states for active environments
+                    h_list = []
+                    c_list = []
+                    env_id_active = 0
+                    for env_id in range(num_envs):
+                        if step_counts[env_id] < max_steps:
+                            creature = self.env.creatures[env_id]
+                            h, c = creature.rnn_state
+                            h_list.append(h)
+                            c_list.append(c)
+                    
+                    h_batch = torch.cat(h_list, dim=0)  # (num_active, hidden)
+                    c_batch = torch.cat(c_list, dim=0)  # (num_active, hidden)
+                    
+                    (mu, log_std), values, (new_h, new_c) = self.model(
+                        obs_batch, edge_idx, prev_state=(h_batch, c_batch)
+                    )
+                    
+                    # Sample actions
+                    std = torch.exp(log_std)
+                    u = mu + torch.randn_like(mu) * std
+                    actions = torch.tanh(u)  # (batch, 12)
+                    
+                    # Compute log probs
+                    log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
+                    log_prob_gaussian = log_prob_gaussian - log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI
+                    tanh_correction = -torch.log(1.0 - actions ** 2 + self.log_eps).sum(dim=1)
+                    log_probs = log_prob_gaussian + tanh_correction
+                    
+                    # Process results for each environment
+                    env_id_active = 0
+                    for env_id in range(num_envs):
+                        if step_counts[env_id] < max_steps:
+                            creature = self.env.creatures[env_id]
+                            
+                            # Extract results for this environment
+                            mu_i = mu[env_id_active:env_id_active+1]
+                            action_i = actions[env_id_active:env_id_active+1]
+                            value_i = values[env_id_active:env_id_active+1]
+                            log_prob_i = log_probs[env_id_active]
+                            
+                            # Update RNN state
+                            creature.rnn_state = (
+                                new_h[env_id_active:env_id_active+1],
+                                new_c[env_id_active:env_id_active+1]
+                            )
+                            
+                            # Scale action to motor torques
+                            motor_torques = action_i[0] * 5.0
+                            
+                            # Compute reward
+                            reward, com_dist, _ = self.physics._compute_reward(
+                                creature, motor_torques, self.env.goal_pos_t
+                            )
+                            
+                            # Check if done
+                            done = float(com_dist) < self.physics.com_distance_threshold
+                            if done:
+                                self.env.spawn_random_goal(env_id)
+                                # NOTE: creature.rnn_state intentionally NOT reset here
+                                # This is a CONTINUING task - the agent remembers across goals
+                                # Training will handle episode boundaries separately
+                            
+                            # Get next value
+                            with torch.no_grad():
+                                next_obs = self.env.observe(creature)
+                                # RNN state carries forward to next goal for continuity
+                                (_, _), next_value, _ = self.model(
+                                    next_obs, edge_idx, prev_state=creature.rnn_state
+                                )
+                            
+                            # Store transition
+                            trajectories[env_id].append({
+                                'obs': obs_list[env_id_active],
+                                'action': action_i,
+                                'reward': reward,
+                                'value': value_i.squeeze().detach(),
+                                'next_value': next_value.squeeze().detach(),
+                                'done': float(done),
+                                'old_log_prob': log_prob_i.detach(),
+                            })
+                            
+                            step_counts[env_id] += 1
+                            env_id_active += 1
+                
+                except RuntimeError as e:
+                    # Fallback: if batch processing fails, fall back to sequential
+                    logger.warning(f"Batch processing failed: {e}, falling back to sequential")
+                    return self.collect_trajectory_sequential(max_steps)
+        
+        # Wrap trajectories with metadata for batch training
+        trajectories_wrapped = []
+        for env_id, traj in enumerate(trajectories):
+            if traj:  # Only include non-empty trajectories
+                trajectories_wrapped.append({
+                    'env_id': env_id,
+                    'edge_index': self.env.edge_indices[env_id],
+                    'trajectory': traj
+                })
+        return trajectories_wrapped
+    
+    def collect_trajectory_sequential(self, max_steps=500):
+        """
+        Sequential trajectory collection (original implementation).
+        Used as fallback if vectorized version fails.
+        Returns list of dicts: {env_id, edge_index, trajectory_data}
+        """
+        trajectories = []
+        for env_id in range(self.env.num_envs):
+            traj = self.collect_trajectory(max_steps=max_steps, env_id=env_id)
+            if traj:
+                # Wrap trajectory with metadata to prevent index misalignment
+                trajectories.append({
+                    'env_id': env_id,
+                    'edge_index': self.env.edge_indices[env_id],
+                    'trajectory': traj
+                })
+        return trajectories
+    
     def collect_trajectory(self, max_steps=500, env_id=0):
         """
         Collect one episode trajectory for quadruped balance task.
@@ -469,7 +626,7 @@ class TrainingEngine:
         
         # Store initial COM distance for tracking
         from .entity import compute_center_of_mass
-        com_pos = compute_center_of_mass(creature.joint_angles, self.device, self.dtype)
+        com_pos = compute_center_of_mass(creature.joint_angles, creature.orientation)
         prev_com_dist = torch.norm(self.env.goal_pos_t[:2] - com_pos[:2])
         
         while step_count < max_steps:
@@ -505,12 +662,16 @@ class TrainingEngine:
             done = float(com_dist) < self.physics.com_distance_threshold
             if done:
                 self.env.spawn_random_goal(env_id)
-                com_pos = compute_center_of_mass(creature.joint_angles, self.device, self.dtype)
+                com_pos = compute_center_of_mass(creature.joint_angles, creature.orientation)
                 prev_com_dist = torch.norm(self.env.goal_pos_t[:2] - com_pos[:2])
+                # NOTE: creature.rnn_state intentionally NOT reset here
+                # This is a CONTINUING task - the agent remembers across goals
+                # Training will handle episode boundaries separately
             
             # Get next value estimate
             with torch.no_grad():
                 next_obs = self.env.observe(creature)
+                # RNN state carries forward to next goal for continuity
                 (next_mu, next_log_std), next_value, _ = self.model(
                     next_obs, edge_idx, prev_state=creature.rnn_state
                 )
@@ -562,10 +723,8 @@ class TrainingEngine:
         obs_list = [t['obs'] for t in trajectory]
         action_list = [t['action'] for t in trajectory]
         
-        use_autocast = self.device.type == 'cuda'
-        
         for _ in range(Config.PPO_EPOCHS):
-            with torch.autocast(device_type='cuda', enabled=use_autocast):
+            with torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
                 logits_list = []
                 value_list = []
                 
@@ -575,6 +734,8 @@ class TrainingEngine:
                 for t, obs in enumerate(obs_list):
                     (mu, log_std), value, state = self.model(obs, self.env.edge_indices[0], prev_state=state)
                     logits_list.append((mu, log_std))
+                    # During training: treat goal_reached (done) as episode boundary
+                    # Reset RNN state when done=1 (episodic training)
                     value_list.append(value)
                     
                     h, c = state
@@ -625,17 +786,33 @@ class TrainingEngine:
         logger.info(msg)
         print(msg)
     
-    def train_on_trajectories_batch(self, trajectories):
-        """Train on multiple trajectories from vectorized environments."""
-        if not trajectories:
+    def train_on_trajectories_batch(self, trajectories_wrapped):
+        """Train on multiple trajectories from vectorized environments.
+        
+        Args:
+            trajectories_wrapped: list of dicts with {'env_id', 'edge_index', 'trajectory'}
+        """
+        if not trajectories_wrapped:
             return
         
+        # Filter out empty trajectories, preserving metadata
+        trajectories_wrapped = [t for t in trajectories_wrapped if len(t['trajectory']) > 0]
+        if not trajectories_wrapped:
+            logger.warning("No valid trajectories to train on")
+            return
+        
+        logger.info(f"[BATCH DEBUG] Training on {len(trajectories_wrapped)} trajectories")
+        for i, traj_data in enumerate(trajectories_wrapped):
+            traj = traj_data['trajectory']
+            traj_reward = sum(float(step['reward']) for step in traj)
+            logger.info(f"  Traj {i} (env_id={traj_data['env_id']}): len={len(traj)}, total_reward={traj_reward:.2f}")
+        
         total_wm_loss = 0.0
-        for trajectory in trajectories:
-            wm_loss = self.train_world_model(trajectory)
+        for traj_data in trajectories_wrapped:
+            wm_loss = self.train_world_model(traj_data['trajectory'])
             total_wm_loss += wm_loss
-        avg_wm_loss = total_wm_loss / len(trajectories)
-        logger.info(f"  Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories)} envs)")
+        avg_wm_loss = total_wm_loss / len(trajectories_wrapped)
+        logger.info(f"  Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)")
         
         self.model.train()
         
@@ -646,8 +823,12 @@ class TrainingEngine:
         all_old_log_probs = []
         all_obs = []
         all_actions = []
+        all_edge_indices = []  # NEW: Store edge indices aligned with trajectories
         
-        for trajectory in trajectories:
+        for traj_data in trajectories_wrapped:
+            trajectory = traj_data['trajectory']
+            edge_idx = traj_data['edge_index']
+            
             rewards = torch.stack([t['reward'] for t in trajectory]).squeeze(-1)
             values = torch.stack([t['value'] for t in trajectory])
             next_values = torch.stack([t['next_value'] for t in trajectory])
@@ -663,6 +844,7 @@ class TrainingEngine:
             all_old_log_probs.append(old_log_probs)
             all_obs.append(obs_list)
             all_actions.append(action_list)
+            all_edge_indices.append(edge_idx)  # NEW: Store edge index for this trajectory
         
         rewards_batch = torch.cat(all_rewards)
         values_batch = torch.cat(all_values)
@@ -680,12 +862,18 @@ class TrainingEngine:
         returns_batch = advantages_raw + values_batch.squeeze()
         advantages_batch = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
         
-        use_autocast = self.device.type == 'cuda'
+        # Debug: log shapes and value ranges
+        logger.info(f"[SHAPES] advantages_batch: {advantages_batch.shape}, min={advantages_batch.min():.4f}, max={advantages_batch.max():.4f}")
+        logger.info(f"[SHAPES] returns_batch: {returns_batch.shape}, min={returns_batch.min():.4f}, max={returns_batch.max():.4f}")
+        logger.info(f"[SHAPES] old_log_probs_batch: {old_log_probs_batch.shape}, min={old_log_probs_batch.min():.4f}, max={old_log_probs_batch.max():.4f}")
+        logger.info(f"[SHAPES] values_batch: {values_batch.shape}, min={values_batch.min():.4f}, max={values_batch.max():.4f}")
+        logger.info(f"[SHAPES] next_values_batch: {next_values_batch.shape}, min={next_values_batch.min():.4f}, max={next_values_batch.max():.4f}")
+        
         total_policy_loss = 0.0
         total_value_loss = 0.0
         
-        for _ in range(Config.PPO_EPOCHS):
-            with torch.autocast(device_type='cuda', enabled=use_autocast):
+        for epoch in range(Config.PPO_EPOCHS):
+            with torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
                 logits_list = []
                 value_list = []
                 
@@ -694,8 +882,11 @@ class TrainingEngine:
                     h0, c0 = self.model.init_state(1, self.device, self.dtype)
                     state = (h0.clone(), c0.clone())
                     
+                    # Use edge_index stored with this trajectory, not global index
+                    edge_idx = all_edge_indices[traj_idx]
+                    
                     for obs in obs_list:
-                        (mu, log_std), value, state = self.model(obs, self.env.edge_indices[traj_idx], prev_state=state)
+                        (mu, log_std), value, state = self.model(obs, edge_idx, prev_state=state)
                         logits_list.append((mu, log_std))
                         value_list.append(value)
                         
@@ -715,17 +906,63 @@ class TrainingEngine:
                 
                 mu = mu_seq
                 std = torch.exp(log_std_seq)
+                
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] mu: min={mu.min():.6f}, max={mu.max():.6f}, has_nan={torch.isnan(mu).any()}")
+                    logger.info(f"[EPOCH {epoch}] std: min={std.min():.6f}, max={std.max():.6f}, has_nan={torch.isnan(std).any()}")
+                
                 a = torch.clamp(action_batch, -1.0 + self.physics.atanh_eps, 1.0 - self.physics.atanh_eps)
+                
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] action_batch (clamped): min={a.min():.6f}, max={a.max():.6f}, has_nan={torch.isnan(a).any()}")
+                
                 u = 0.5 * (torch.log1p(a) - torch.log1p(-a))
                 
-                log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
-                log_prob_gaussian = log_prob_gaussian - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI  # 12D action space
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] u (inverse_tanh): min={u.min():.6f}, max={u.max():.6f}, has_nan={torch.isnan(u).any()}")
                 
-                tanh_correction = -torch.log(1.0 - action_batch ** 2 + self.physics.log_eps).sum(dim=1)
+                # First compute the Gaussian log prob
+                action_diff = u - mu  # (T, 12)
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] (u - mu): min={action_diff.min():.6f}, max={action_diff.max():.6f}, has_nan={torch.isnan(action_diff).any()}")
+                
+                gaussian_term = -0.5 * ((action_diff) ** 2 / (std ** 2)).sum(dim=1)  # (T,)
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] gaussian_term: min={gaussian_term.min():.6f}, max={gaussian_term.max():.6f}, has_nan={torch.isnan(gaussian_term).any()}")
+                
+                log_prob_gaussian = gaussian_term - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] log_prob_gaussian: min={log_prob_gaussian.min():.6f}, max={log_prob_gaussian.max():.6f}, has_nan={torch.isnan(log_prob_gaussian).any()}")
+                
+                # Now tanh correction  
+                action_sq_term = 1.0 - action_batch ** 2
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] (1 - action^2): min={action_sq_term.min():.6f}, max={action_sq_term.max():.6f}, has_nan={torch.isnan(action_sq_term).any()}")
+                
+                tanh_correction = -torch.log(action_sq_term + self.physics.log_eps).sum(dim=1)
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] tanh_correction: min={tanh_correction.min():.6f}, max={tanh_correction.max():.6f}, has_nan={torch.isnan(tanh_correction).any()}")
+                
                 log_prob_seq = log_prob_gaussian + tanh_correction
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] log_prob_seq (final): min={log_prob_seq.min():.6f}, max={log_prob_seq.max():.6f}, has_nan={torch.isnan(log_prob_seq).any()}")
+                    logger.info(f"[EPOCH {epoch}] old_log_probs_batch: min={old_log_probs_batch.min():.6f}, max={old_log_probs_batch.max():.6f}, has_nan={torch.isnan(old_log_probs_batch).any()}")
                 
-                ratio = torch.exp(log_prob_seq - old_log_probs_batch)
+                log_prob_diff = log_prob_seq - old_log_probs_batch
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] log_prob_diff: min={log_prob_diff.min():.6f}, max={log_prob_diff.max():.6f}, has_nan={torch.isnan(log_prob_diff).any()}")
+                
+                ratio = torch.exp(log_prob_diff)
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] ratio: min={ratio.min():.6f}, max={ratio.max():.6f}, has_nan={torch.isnan(ratio).any()}, has_inf={torch.isinf(ratio).any()}")
+                
                 clipped_ratio = torch.clamp(ratio, 1.0 - Config.PPO_CLIP_RATIO, 1.0 + Config.PPO_CLIP_RATIO)
+                
+                if epoch == 0:
+                    logger.info(f"[EPOCH {epoch}] advantages_batch: min={advantages_batch.min():.6f}, max={advantages_batch.max():.6f}, has_nan={torch.isnan(advantages_batch).any()}")
+                    logger.info(f"[EPOCH {epoch}] ratio * advantages: min={(ratio * advantages_batch).min():.6f}, max={(ratio * advantages_batch).max():.6f}, has_nan={torch.isnan(ratio * advantages_batch).any()}")
+                    logger.info(f"[EPOCH {epoch}] clipped_ratio * advantages: min={(clipped_ratio * advantages_batch).min():.6f}, max={(clipped_ratio * advantages_batch).max():.6f}, has_nan={torch.isnan(clipped_ratio * advantages_batch).any()}")
+                
                 policy_loss = -torch.min(ratio * advantages_batch, clipped_ratio * advantages_batch).mean()
                 
                 v_pred = value_seq.squeeze()
@@ -745,9 +982,14 @@ class TrainingEngine:
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
         
-        batch_reward = sum(sum(float(t['reward']) for t in traj) for traj in trajectories) / len(trajectories)
+        # Calculate average reward across all trajectories
+        batch_reward = sum(sum(float(t['reward']) for t in traj_data['trajectory']) for traj_data in trajectories_wrapped) / len(trajectories_wrapped)
         self.episode_rewards.append(batch_reward)
-        msg = f"Batch Ep {self.episode_count}: avg_reward={batch_reward:.2f}, policy_loss={total_policy_loss/Config.PPO_EPOCHS:.4f}, value_loss={total_value_loss/Config.PPO_EPOCHS:.4f}"
+        
+        # Log debugging info
+        msg = f"Batch Ep {self.episode_count}: avg_reward={batch_reward:.2f}"
+        if not torch.isnan(policy_loss) and not torch.isnan(value_loss):
+            msg += f", policy_loss={total_policy_loss/Config.PPO_EPOCHS:.4f}, value_loss={total_value_loss/Config.PPO_EPOCHS:.4f}"
         logger.info(msg)
         print(msg)
     
@@ -769,7 +1011,8 @@ class TrainingEngine:
             batch_next_obs = []
             batch_rewards = []
             
-            for i in idx:
+            # Convert tensor indices to Python ints for list indexing
+            for i in idx.tolist():
                 batch_obs.append(trajectory[i]['obs'])
                 batch_actions.append(trajectory[i]['action'])
                 batch_next_obs.append(trajectory[i + 1]['obs'])
@@ -831,17 +1074,14 @@ class System:
             
             while not training_complete:
                 if self.env.use_vectorized:
-                    # Vectorized: collect from all environments in parallel
-                    for env_id in range(self.env.num_envs):
-                        trajectory = self.training.collect_trajectory(max_steps=Config.MAX_STEPS_PER_EPISODE, env_id=env_id)
-                        if trajectory:
-                            trajectories_batch.append(trajectory)
+                    # Parallel trajectory collection across all environments
+                    trajectories_batch = self.training.collect_trajectories_vectorized(max_steps=Config.MAX_STEPS_PER_EPISODE)
+                    logger.info(f"Collected {len(trajectories_batch)} trajectories in parallel")
                     
                     # Train once per batch
-                    if trajectories_batch:
+                    if trajectories_batch and any(trajectories_batch):
                         self.training.train_on_trajectories_batch(trajectories_batch)
                         self.training.episode_count += 1
-                        trajectories_batch = []
                         self.training.save_checkpoint()
                 else:
                     # Single environment

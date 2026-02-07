@@ -1,18 +1,8 @@
 """
-Advanced Physics Engine for Quadruped Robot
+Advanced Physics Engine for Quadruped Robot.
+See docs/PHYSICS.md for detailed feature documentation.
 
-Features:
-1. Quaternion-based rigid body orientation (no gimbal lock)
-2. Full rigid body dynamics (angular momentum, inertia tensor)
-3. Spring-damper contact model with Coulomb friction
-4. Contact impulse resolution
-5. Continuous collision detection (CCD) infrastructure
-6. Gyroscopic effects for realistic balance
-
-Key Classes:
-- Quaternion: Gimbal-lock-free orientation representation
-- RigidBody: Core physics object with full dynamics
-- ContactManifold: Contact point management and impulse resolution
+Key Classes: Quaternion (gimbal-lock-free), RigidBody (full dynamics), ContactManifold (impulse resolution).
 """
 
 import torch
@@ -114,14 +104,8 @@ class Quaternion:
 
 @dataclass
 class RigidBody:
-    """
-    Rigid body with full dynamics: position, orientation, linear/angular velocity.
-    
-    Includes:
-    - Position and quaternion-based orientation
-    - Linear and angular velocities
-    - Mass and inertia tensor
-    - Force and torque accumulation for next integration step
+    """Rigid body with full dynamics: position, orientation, linear/angular velocity.
+    See docs/PHYSICS.md for detailed equations.
     """
     pos: np.ndarray              # (3,) COM position
     orientation: Quaternion      # Rotation quaternion
@@ -242,7 +226,15 @@ class ContactManifold:
             self.friction_coeff = Config.GROUND_FRICTION_COEFFICIENT
     
     def solve_impulse(self, dt: float, bias: float = 0.2):
-        """Resolve contact using sequential impulses (Box2D style)."""
+        """
+        Resolve contact using sequential impulses with Baumgarte stabilization and friction (Box2D style).
+        
+        Implements:
+        1. Effective mass scaling: impulse = velocity_constraint / inv_mass_sum
+        2. Baumgarte bias: adds positional correction based on penetration depth
+        3. Friction cone: accumulated impulses clamped to mu * normal_impulse
+        4. Sequential impulse accumulation with separating guard
+        """
         # Relative velocity at contact
         v_a = self.body_a.linear_vel + np.cross(self.body_a.angular_vel, self.pos - self.body_a.pos)
         
@@ -254,9 +246,6 @@ class ContactManifold:
         rel_vel = v_b - v_a
         vel_along_normal = np.dot(rel_vel, self.normal)
         
-        if vel_along_normal < 0:
-            return
-        
         # Build tangent space
         tangent1 = np.cross([0, 0, 1], self.normal)
         if np.linalg.norm(tangent1) < 0.1:
@@ -264,13 +253,59 @@ class ContactManifold:
         tangent1 /= np.linalg.norm(tangent1)
         tangent2 = np.cross(self.normal, tangent1)
         
-        # Simplified: normal impulse only (friction cone not yet implemented)
-        impulse_mag = -(1 + self.restitution) * vel_along_normal
-        impulse = impulse_mag * self.normal
+        # Compute effective mass (inverse mass sum for linear contact)
+        inv_mass_a = 1.0 / self.body_a.mass if self.body_a.mass > 0 else 0
+        inv_mass_b = (1.0 / self.body_b.mass if self.body_b.mass > 0 else 0) if self.body_b is not None else 0
+        inv_mass_sum = inv_mass_a + inv_mass_b
         
-        self.body_a.linear_vel -= impulse / self.body_a.mass
+        # Guard: skip if no effective mass (both bodies infinite mass)
+        if inv_mass_sum < 1e-6:
+            return
+        
+        # Baumgarte stabilization bias: correct positional error via velocity constraint
+        baumgarte_bias = bias * max(0, self.penetration - 0.01) / dt if dt > 0 else 0
+        
+        # Compute velocity constraint for normal direction
+        # Include both restitution (bounciness) and Baumgarte bias (penetration correction)
+        velocity_constraint = -(1 + self.restitution) * vel_along_normal - baumgarte_bias
+        
+        # Sequential impulse with proper mass scaling
+        # impulse_magnitude = velocity_constraint / inv_mass_sum
+        old_normal_impulse = self.accumulated_normal_impulse
+        self.accumulated_normal_impulse = max(0, self.accumulated_normal_impulse + velocity_constraint / inv_mass_sum)
+        delta_normal_impulse = self.accumulated_normal_impulse - old_normal_impulse
+        
+        # Apply normal impulse (scaled by mass inverse)
+        impulse_normal = delta_normal_impulse * self.normal
+        self.body_a.linear_vel -= impulse_normal * inv_mass_a
         if self.body_b is not None:
-            self.body_b.linear_vel += impulse / self.body_b.mass
+            self.body_b.linear_vel += impulse_normal * inv_mass_b
+        
+        # Friction (tangent plane) - only apply if in contact (normal impulse > 0)
+        if self.accumulated_normal_impulse > 0:
+            vel_t1 = np.dot(rel_vel, tangent1)
+            vel_t2 = np.dot(rel_vel, tangent2)
+            
+            # Tangent impulses (dry friction model)
+            friction_limit = self.friction_coeff * self.accumulated_normal_impulse
+            
+            # Tangent 1
+            velocity_constraint_t1 = -vel_t1 / inv_mass_sum if inv_mass_sum > 0 else 0
+            old_t1 = self.accumulated_tangent_impulse[0]
+            self.accumulated_tangent_impulse[0] = np.clip(old_t1 + velocity_constraint_t1, -friction_limit, friction_limit)
+            delta_t1 = self.accumulated_tangent_impulse[0] - old_t1
+            
+            # Tangent 2
+            velocity_constraint_t2 = -vel_t2 / inv_mass_sum if inv_mass_sum > 0 else 0
+            old_t2 = self.accumulated_tangent_impulse[1]
+            self.accumulated_tangent_impulse[1] = np.clip(old_t2 + velocity_constraint_t2, -friction_limit, friction_limit)
+            delta_t2 = self.accumulated_tangent_impulse[1] - old_t2
+            
+            # Apply friction impulses (mass-scaled)
+            impulse_friction = delta_t1 * tangent1 + delta_t2 * tangent2
+            self.body_a.linear_vel -= impulse_friction * inv_mass_a
+            if self.body_b is not None:
+                self.body_b.linear_vel += impulse_friction * inv_mass_b
 
 
 class PhysicsEngine:
@@ -337,18 +372,8 @@ class PhysicsEngine:
     
     def apply_motor_torques(self, creature, motor_torques):
         """
-        Apply motor torques with advanced rigid body dynamics.
-        
-        Improvements:
-        1. Quaternion-based orientation (no gimbal lock)
-        2. Inertia tensor + Euler equations for realistic rotation
-        3. Contact-dependent gravity (supports legs, reduces falling torque)
-        4. Spring-damper + friction model for ground contact
-        5. Gyroscopic effects for stability
-        
-        Args:
-            creature: Creature object with leg states
-            motor_torques: (12,) tensor of desired joint torques
+        Apply motor torques and integrate rigid body dynamics (quaternion-based orientation, Euler equations).
+        See docs/PHYSICS.md for implementation details.
         
         Returns:
             com_pos: (3,) new center of mass position
@@ -356,7 +381,7 @@ class PhysicsEngine:
         """
         motor_torques = torch.clamp(motor_torques, -self.max_torque, self.max_torque)
         
-        # Update joint dynamics (simple torque → angle integration)
+        # Update joint dynamics
         creature.joint_velocities.copy_(
             creature.joint_velocities + (motor_torques - self.joint_damping * creature.joint_velocities) * self.dt
         )
@@ -366,11 +391,14 @@ class PhysicsEngine:
         creature.joint_angles.copy_(creature.joint_angles + creature.joint_velocities * self.dt)
         creature.joint_angles.copy_(torch.clamp(creature.joint_angles, -math.pi, math.pi))
         
-        # Compute foot positions and COM via forward kinematics
-        from .entity import compute_foot_positions, compute_center_of_mass
+        # Compute foot positions via forward kinematics
+        from .entity import compute_foot_positions
         
-        foot_positions = compute_foot_positions(creature.joint_angles, self.device, self.dtype, self.segment_length)
-        com_pos = compute_center_of_mass(creature.joint_angles, self.device, self.dtype, self.segment_length)
+        foot_positions = compute_foot_positions(creature.joint_angles, creature.orientation, self.segment_length)
+        
+        # Note: Agent COM is creature.pos (rigid body center of mass)
+        # Kinematic COM from joint forward kinematics is not used for reward/control
+        # (creature.pos is the actual integrated body position from physics)
         
         # ADVANCED: Detect contacts and apply forces to rigid body
         num_contacts = 0
@@ -388,33 +416,35 @@ class PhysicsEngine:
                 contact_normal_force = self.contact_stiffness * penetration
                 contact_damper_force = self.contact_damping * float(self.body.linear_vel[2])
                 
-                contact_force_z = contact_normal_force - contact_damper_force
-                contact_force_total[2] += contact_force_z / 4.0
+                # Unilateral contact: force cannot pull (no adhesion)
+                contact_force_z = max(0.0, contact_normal_force - contact_damper_force)
+                contact_force_total[2] += contact_force_z
             else:
                 creature.foot_contact[foot_idx] = 0.0
         
-        # Apply forces to rigid body (using advanced dynamics)
-        # Gravity (contact-dependent: less gravity when supported)
+        # Normalize contact force by contacting feet
+        if num_contacts > 0:
+            contact_force_total[2] /= num_contacts
+        
+        # Apply forces to rigid body (contact-dependent gravity)
         gravity_factor = 1.0 - min(num_contacts, 4) / 4.0
         self.body.add_force(np.array([0, 0, -self.gravity * self.body.mass * gravity_factor]))
-        
-        # Contact reaction forces
         self.body.add_force(contact_force_total)
         
-        # Integrate rigid body (Euler equations, quaternion rotation, gyroscopic effects)
-        self.body.integrate(self.dt, gravity=0)  # Gravity already applied as force
+        # Integrate rigid body dynamics
+        self.body.integrate(self.dt, gravity=0)
         
-        # Sync creature position with body COM
-        creature.pos = torch.tensor(self.body.pos, device=self.device, dtype=self.dtype)
+        # Sync creature position with body COM (in-place update to preserve tensor references)
+        creature.pos.copy_(torch.as_tensor(self.body.pos, device=self.device, dtype=self.dtype))
         
-        # Update orientation from quaternion
+        # Update orientation from quaternion (element-wise, preserving tensor reference)
         pitch, yaw, roll = self.body.orientation.to_euler()
-        creature.orientation[0] = pitch
-        creature.orientation[1] = yaw
-        creature.orientation[2] = roll
+        creature.orientation[0] = float(pitch)
+        creature.orientation[1] = float(yaw)
+        creature.orientation[2] = float(roll)
         
-        # Sync linear and angular velocity
-        creature.velocity = torch.tensor(self.body.linear_vel, device=self.device, dtype=self.dtype)
+        # Sync linear and angular velocity (in-place update to preserve tensor references)
+        creature.velocity.copy_(torch.as_tensor(self.body.linear_vel, device=self.device, dtype=self.dtype))
         
         # Stability metrics
         stability_metrics = {
@@ -429,55 +459,49 @@ class PhysicsEngine:
         return creature.pos, stability_metrics
     
     
-    def compute_balance_reward(self, creature, com_pos, stability_metrics, motor_torques, goal_pos):
+    def compute_balance_reward(self, com_pos, stability_metrics, motor_torques, goal_pos):
         """
-        Compute reward based on balance and stability (agent-centered world).
-        
-        AGENT-CENTERED COORDINATES:
-        - Agent COM is always at origin (0, 0, 0) in local frame
-        - Goal position is relative to agent
-        - Simplifies distance calculations
-        
-        Reward components:
-        1. COM distance to goal (main objective)
-        2. Stability (pitch/roll limits, contact count)
-        3. Energy efficiency (negative reward for high torques)
+        Compute reward: balance (primary) > goal-reaching (secondary) > efficiency (tertiary).
+        See docs/EVALUATION.md for reward structure details.
         """
-        # 1. COM position relative to goal (XZ plane, ignore Y for balance task)
-        # In agent-centered world: agent is at origin, goal is offset
-        com_xy = torch.stack([com_pos[0], com_pos[2]])
-        goal_xy = torch.stack([goal_pos[0], goal_pos[2]])
-        com_dist = torch.norm(com_xy - goal_xy)
+        # Keep as tensors for autograd compatibility
+        pitch = stability_metrics['pitch']
+        roll = stability_metrics['roll']
         
-        # COM distance reward: smooth, naturally bounded function
-        # Use exponential decay: rewards decrease smoothly as agent gets closer
-        # Range: exp(0)=1 at dist=0, approaches 0 as dist→∞
-        com_reward = torch.exp(-com_dist)
+        # Balance reward: reward staying upright (small pitch/roll)
+        # Quadratic penalty grows with tilt angle: discourages falling
+        balance_reward = torch.exp(-0.5 * (pitch**2 + roll**2) / (0.1**2))  # Strong reward for upright
         
-        # 2. Stability reward
-        pitch = float(stability_metrics['pitch'])
-        roll = float(stability_metrics['roll'])
-        
-        # Penalty if too tilted (indicate loss of balance)
-        tilt_penalty = 0
-        if abs(pitch) > self.max_pitch_roll or abs(roll) > self.max_pitch_roll:
-            tilt_penalty = -self.tilt_penalty
-        
-        # Contact bonus (prefer multiple foot contacts for stability)
+        # Contact bonus: prefer multiple foot contacts
         num_contacts = stability_metrics['num_contacts']
-        contact_reward = min(num_contacts, 4) * self.contact_reward  # Up to 4 feet
+        contact_reward = min(num_contacts, 4) * self.contact_reward
         
-        # 3. Energy penalty (discourage excessive torques to encourage efficiency)
+        # Hard penalty for excessive tilt
+        stability_penalty = 0.0
+        if abs(pitch) > self.max_pitch_roll or abs(roll) > self.max_pitch_roll:
+            stability_penalty = -self.tilt_penalty
+        
+        # Goal reaching reward (secondary, modulated by stability)
+        goal_relative = goal_pos - com_pos
+        goal_xy = torch.stack([goal_relative[0], goal_relative[2]])
+        com_dist = torch.norm(goal_xy)
+        
+        # Goal reward: reach goal while maintaining balance
+        stability_factor = max(0.0, 1.0 - (abs(pitch) + abs(roll)) / (2 * self.max_pitch_roll))
+        goal_reward = torch.exp(-com_dist) * stability_factor
+        
+        # 2. Energy penalty (discourage excessive torques to encourage efficiency)
         torque_magnitude = torch.norm(motor_torques)
         energy_cost = torque_magnitude * self.energy_penalty
         
-        # Total reward
-        total_reward = com_reward + tilt_penalty + contact_reward - energy_cost
+        # Total reward: balance is primary, goal-reaching is secondary
+        # Order: stability (balance + contacts + penalties) > goal reaching > efficiency
+        total_reward = balance_reward + contact_reward + stability_penalty + goal_reward - energy_cost
         
         return total_reward, com_dist
     
     def _compute_reward(self, creature, motor_torques, goal_pos):
         """High-level reward computation for quadruped balance task."""
         com_pos, stability_metrics = self.apply_motor_torques(creature, motor_torques)
-        reward, com_dist = self.compute_balance_reward(creature, com_pos, stability_metrics, motor_torques, goal_pos)
+        reward, com_dist = self.compute_balance_reward(com_pos, stability_metrics, motor_torques, goal_pos)
         return reward, com_dist, stability_metrics

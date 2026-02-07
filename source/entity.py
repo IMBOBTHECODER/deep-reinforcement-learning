@@ -6,64 +6,124 @@ from typing import Tuple, Optional
 import math
 
 
-def forward_kinematics_leg(joint_angles, leg_idx, segment_length=0.1):
+# Module-level constants for kinematic offsets (avoid rebuilding on every call)
+_HIP_OFFSETS_RAW = {
+    0: [0.15, 0.0, -0.1],    # Front-left
+    1: [0.15, 0.0, 0.1],     # Front-right
+    2: [-0.15, 0.0, -0.1],   # Back-left
+    3: [-0.15, 0.0, 0.1],    # Back-right
+}
+
+
+def forward_kinematics_leg(joint_angles, leg_idx, orientation=None, segment_length=0.1):
     """
-    Compute foot position for a single leg using forward kinematics.
+    Compute foot position via forward kinematics with 3D body orientation.
+    See docs/PHYSICS.md for modeling details (2D pitch-plane articulation + 3D rotation).
     
     Args:
-        joint_angles: (3,) angles for hip, knee, ankle
+        joint_angles: (3,) angles for hip, knee, ankle (cumulative pitch rotations)
         leg_idx: which leg (0=FL, 1=FR, 2=BL, 3=BR)
+        orientation: (3,) [pitch, yaw, roll] body orientation or None for identity
         segment_length: length of each joint segment
     
     Returns:
-        foot_pos: (3,) absolute foot position relative to body center
+        foot_pos: (3,) foot position in world frame
     """
-    # Hip offsets from body center (for 4-legged quadruped)
-    hip_offsets = {
-        0: torch.tensor([0.15, 0.0, -0.1]),    # Front-left
-        1: torch.tensor([0.15, 0.0, 0.1]),     # Front-right
-        2: torch.tensor([-0.15, 0.0, -0.1]),   # Back-left
-        3: torch.tensor([-0.15, 0.0, 0.1]),    # Back-right
-    }
+    # Create hip offset on correct device/dtype (cheap conversion from list)
+    hip_pos = torch.tensor(_HIP_OFFSETS_RAW[leg_idx], dtype=joint_angles.dtype, device=joint_angles.device)
     
-    hip_pos = hip_offsets[leg_idx].to(joint_angles.device).to(joint_angles.dtype)
-    
-    # Forward kinematics: each joint adds to position
-    # Simplified 2D linkage in the vertical plane (pitch rotation)
+    # Forward kinematics: each joint adds to position in local (pitch plane)
     theta1, theta2, theta3 = joint_angles[0], joint_angles[1], joint_angles[2]
     
-    # Cumulative angles for each segment
+    # Cumulative angles for each segment (pitch plane only)
     angle1 = theta1
     angle2 = theta1 + theta2
     angle3 = theta1 + theta2 + theta3
     
-    # Segment positions
-    p1 = hip_pos + torch.tensor([0, -segment_length * math.cos(float(angle1)), 
-                                 -segment_length * math.sin(float(angle1))],
-                                dtype=joint_angles.dtype, device=joint_angles.device)
-    p2 = p1 + torch.tensor([0, -segment_length * math.cos(float(angle2)), 
-                            -segment_length * math.sin(float(angle2))],
-                           dtype=joint_angles.dtype, device=joint_angles.device)
-    p3 = p2 + torch.tensor([0, -segment_length * math.cos(float(angle3)), 
-                            -segment_length * math.sin(float(angle3))],
-                           dtype=joint_angles.dtype, device=joint_angles.device)
+    # Use torch trig ops to preserve autograd and device/dtype
+    c1, s1 = torch.cos(angle1), torch.sin(angle1)
+    p1_local = torch.stack([torch.tensor(0., dtype=joint_angles.dtype, device=joint_angles.device),
+                            -segment_length * c1,
+                            -segment_length * s1])
     
-    return p3
+    c2, s2 = torch.cos(angle2), torch.sin(angle2)
+    p2_local = p1_local + torch.stack([torch.tensor(0., dtype=joint_angles.dtype, device=joint_angles.device),
+                                       -segment_length * c2,
+                                       -segment_length * s2])
+    
+    c3, s3 = torch.cos(angle3), torch.sin(angle3)
+    p3_local = p2_local + torch.stack([torch.tensor(0., dtype=joint_angles.dtype, device=joint_angles.device),
+                                       -segment_length * c3,
+                                       -segment_length * s3])
+    
+    # Apply body orientation to rotate local coordinates to world frame
+    if orientation is not None:
+        p3_local = _rotate_point_by_euler(p3_local, orientation)
+        hip_pos = _rotate_point_by_euler(hip_pos, orientation)
+    
+    return hip_pos + p3_local
 
 
-def compute_center_of_mass(joint_angles, device, dtype, segment_length=0.1):
+def _rotate_point_by_euler(point, euler_angles):
     """
-    Compute center of mass position for quadruped.
-    COM = (body_mass * body_pos + sum(foot_masses * foot_pos)) / total_mass
-    Simplified: equal mass distribution
+    Rotate a 3D point by Euler angles (pitch, yaw, roll).
+    
+    Args:
+        point: (3,) point to rotate
+        euler_angles: (3,) [pitch, yaw, roll] in radians
+    
+    Returns:
+        rotated: (3,) rotated point
+    """
+    pitch, yaw, roll = euler_angles[0], euler_angles[1], euler_angles[2]
+    dtype = point.dtype
+    device = point.device
+    
+    # Rotation matrices for each axis
+    # Pitch (rotation around X axis)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    Rx = torch.tensor([
+        [1., 0., 0.],
+        [0., cp, -sp],
+        [0., sp, cp]
+    ], dtype=dtype, device=device)
+    
+    # Yaw (rotation around Z axis)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    Rz = torch.tensor([
+        [cy, -sy, 0.],
+        [sy, cy, 0.],
+        [0., 0., 1.]
+    ], dtype=dtype, device=device)
+    
+    # Roll (rotation around Y axis)
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    Ry = torch.tensor([
+        [cr, 0., sr],
+        [0., 1., 0.],
+        [-sr, 0., cr]
+    ], dtype=dtype, device=device)
+    
+    # Combined rotation: Rz * Ry * Rx (yaw -> roll -> pitch order)
+    R = Rz @ Ry @ Rx
+    return R @ point
+
+
+def compute_center_of_mass(joint_angles, orientation=None, segment_length=0.1):
+    """
+    Compute center of mass position for quadruped. See docs/PHYSICS.md.
     
     Args:
         joint_angles: (12,) all joint angles [FL, FR, BL, BR]
-        device, dtype: torch device and dtype
+        orientation: (3,) [pitch, yaw, roll] body orientation or None for identity
+        segment_length: length of each joint segment
     
     Returns:
         com_pos: (3,) center of mass position relative to body center
     """
+    device = joint_angles.device
+    dtype = joint_angles.dtype
+    
     body_mass = 1.0
     foot_mass = 0.2  # Each foot is 20% of body
     
@@ -75,18 +135,28 @@ def compute_center_of_mass(joint_angles, device, dtype, segment_length=0.1):
     # Add foot COMs
     total_mass = body_mass
     for leg_idx in range(4):
-        foot_pos = forward_kinematics_leg(joint_angles[leg_idx*3:(leg_idx+1)*3], leg_idx, segment_length)
+        foot_pos = forward_kinematics_leg(joint_angles[leg_idx*3:(leg_idx+1)*3], leg_idx, orientation, segment_length)
         com += foot_mass * foot_pos
         total_mass += foot_mass
     
     return com / total_mass
 
 
-def compute_foot_positions(joint_angles, device, dtype, segment_length=0.1):
-    """Compute all 4 foot positions."""
+def compute_foot_positions(joint_angles, orientation=None, segment_length=0.1):
+    """
+    Compute all 4 foot positions.
+    
+    Args:
+        joint_angles: (12,) all joint angles [FL, FR, BL, BR]
+        orientation: (3,) [pitch, yaw, roll] body orientation in radians, or None for identity
+        segment_length: length of each joint segment
+    
+    Returns:
+        feet: (4, 3) foot positions
+    """
     feet = []
     for leg_idx in range(4):
-        foot_pos = forward_kinematics_leg(joint_angles[leg_idx*3:(leg_idx+1)*3], leg_idx, segment_length)
+        foot_pos = forward_kinematics_leg(joint_angles[leg_idx*3:(leg_idx+1)*3], leg_idx, orientation, segment_length)
         feet.append(foot_pos)
     return torch.stack(feet)  # (4, 3)
 
@@ -99,7 +169,6 @@ class Creature:
     velocity: torch.Tensor  # (3,) [vx, vy, vz]
     orientation: torch.Tensor  # (3,) [pitch, yaw, roll] in radians
     rnn_state: Tuple[torch.Tensor, torch.Tensor]  # (h, c) each (1, hidden)
-    stamina: torch.Tensor   # Scalar tensor for current stamina
     
     # Quadruped leg system: 4 legs, 3 joints each (hip, knee, ankle) = 12 DOF
     joint_angles: torch.Tensor      # (12,) joint angles in radians
@@ -304,10 +373,6 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
         h0 = torch.zeros((1, h_size), dtype=dtype, device=device)
         c0 = torch.zeros((1, h_size), dtype=dtype, device=device)
 
-    # Initialize stamina to max
-    from config import Config
-    stamina_t = torch.tensor(Config.MAX_STAMINA, dtype=dtype, device=device)
-
     # Quadruped leg system: 4 legs, 3 joints each = 12 DOF
     # Initialize joints in a neutral standing position
     # Legs: FL (0-2), FR (3-5), BL (6-8), BR (9-11)
@@ -328,7 +393,7 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
         velocity=vel_t,
         orientation=ori_t,
         rnn_state=(h0, c0),
-        stamina=stamina_t,
+
         joint_angles=joint_angles,
         joint_velocities=joint_velocities,
         foot_contact=foot_contact,

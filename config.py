@@ -16,9 +16,9 @@ class Config:
     # ============ VECTORIZED MULTI-ENVIRONMENT TRAINING ============
     USE_VECTORIZED_ENV = True
     NUM_ENVS = None  # Auto-detect based on available memory
-    MAX_ENVS = 32
+    MAX_ENVS = 8
     MIN_ENVS = 2
-    MAX_DATA_THRESHOLD_MB = 4096
+    MAX_DATA_THRESHOLD_MB = 2048
     
     # Memory model updated for quadruped observation (37D)
     # Observation: (1, 37) float32 = 148 bytes per observation
@@ -48,8 +48,6 @@ class Config:
     LSTM_HIDDEN = 256
     
     # ============ PPO HYPERPARAMETERS ============
-    BATCH_SIZE = 64
-    MINIBATCHES = 4
     PPO_EPOCHS = 4
     PPO_CLIP_RATIO = 0.2
     GAMMA = 0.99
@@ -73,30 +71,25 @@ class Config:
     GOAL_BONUS = 10.0
     DISTANCE_REWARD_SCALE = 0.5
     
-    # ============ STAMINA SYSTEM (optional for balance task) ============
-    MAX_STAMINA = 200.0
-    WALK_COST = 0.5
-    JUMP_COST = 1.0
-    STAMINA_REGEN = 1.0
     
     # ============ PHYSICS SYSTEM - QUADRUPED ============
     # Joint dynamics: motor torques → joint accelerations → velocities → angles
     DT = 0.01  # Timestep: 100 Hz physics simulation
-    JOINT_DAMPING = 0.01  # Angular velocity damping per joint
+    JOINT_DAMPING = 0.05  # Servo motor damping (realistic)
     MAX_TORQUE = 5.0  # Maximum motor torque (N*m)
     SEGMENT_LENGTH = 0.1  # Length of each leg segment (3 segments = 0.3m leg)
     MAX_JOINT_VELOCITY = 10.0  # rad/s
     
     # Ground properties
-    GRAVITY = 9.8  # Actual gravity (used for physics simulation)
+    GRAVITY = 9.81  # Earth gravity (m/s²)
     GROUND_LEVEL = 0.0  # Z-coordinate of ground plane
-    GROUND_FRICTION_COEFFICIENT = 0.8
+    GROUND_FRICTION_COEFFICIENT = 0.9  # Rubber/bio pads on concrete
     FOOT_HEIGHT_THRESHOLD = 0.05  # Distance below ground to register contact
     
     # Contact physics (spring-damper model)
-    CONTACT_STIFFNESS = 0.5  # Spring stiffness for ground contact
-    CONTACT_DAMPING = 0.2  # Damping coefficient for contact
-    CONTACT_RESTITUTION = 0.2  # Bounciness coefficient
+    CONTACT_STIFFNESS = 500.0  # Stiff ground (concrete-like, N/m per foot)
+    CONTACT_DAMPING = 0.15  # Ground damping (realistic for impact)
+    CONTACT_RESTITUTION = 0.1  # Very low bounce (Earth materials)
     
     # Rigid body properties
     BODY_MASS = 5.0  # kg, quadruped torso mass
