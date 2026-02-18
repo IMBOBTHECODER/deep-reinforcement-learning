@@ -405,6 +405,11 @@ class PhysicsEngine:
         self.agent_local_pos = torch.zeros(3, device=device, dtype=dtype)
         self.atanh_eps = Config.ATANH_EPSILON
         self.log_eps = Config.LOG_EPSILON
+        
+        # ===== JOINT CONSTRAINTS (Optional, Phase 5): Realistic joint limits and damping =====
+        # Dictionary: creature_id -> [JointConstraint objects]
+        self.joint_constraints = {}  
+        self.use_joint_constraints = getattr(Config, 'USE_JOINT_CONSTRAINTS', False)
     
     def apply_motor_torques(self, creature, motor_torques):
         """
@@ -595,6 +600,15 @@ class PhysicsEngine:
         # Integrate rigid body dynamics
         self.body.integrate(self.dt, gravity=0)
         
+        # ===== Phase 5: Joint Constraints (Optional) =====
+        # Apply joint constraints to enforce realistic limits and damping
+        if self.use_joint_constraints and id(creature) in self.joint_constraints:
+            creature_id = id(creature)
+            for joint in self.joint_constraints[creature_id]:
+                # Joint constraints apply forces/torques relative to body positions
+                # This enforce limits and damping on top of motor torques
+                joint.apply_constraint(self.body, None, self.dt)
+        
         # Sync creature position with body COM (in-place update to preserve tensor references)
         creature.pos.copy_(torch.as_tensor(self.body.pos, device=self.device, dtype=self.dtype))
         
@@ -648,6 +662,43 @@ class PhysicsEngine:
         
         return coulomb_part + viscous_part
     
+    def configure_joint_constraints(self, creature, joint_configs):
+        """
+        PHASE 5: Configure realistic joint constraints for a creature.
+        
+        Enables joint limits, damping, and friction on top of motor torque control.
+        
+        Args:
+            creature: Creature object to apply joint constraints to
+            joint_configs: List of JointConfig objects (from joint_constraints.py)
+            
+        Example:
+            from source.joint_constraints import QuadrupedJointSetup
+            
+            joints = QuadrupedJointSetup.create_quadruped_joints(device, dtype)
+            physics_engine.configure_joint_constraints(creature, joints)
+        
+        Returns:
+            True if constraints successfully configured, False otherwise
+        """
+        try:
+            from source.joint_constraints import JointConstraint
+            
+            creature_id = id(creature)
+            joint_constraints = []
+            
+            for joint_config in joint_configs:
+                constraint = JointConstraint(joint_config, device=self.device, dtype=self.dtype)
+                joint_constraints.append(constraint)
+            
+            # Store joint constraints for this creature
+            self.joint_constraints[creature_id] = joint_constraints
+            self.use_joint_constraints = True  # Enable constraint processing
+            
+            return True
+        except Exception as e:
+            print(f"[Physics] Failed to configure joint constraints: {e}")
+            return False
     
     def compute_balance_reward(self, com_pos, stability_metrics, motor_torques, goal_pos):
         """

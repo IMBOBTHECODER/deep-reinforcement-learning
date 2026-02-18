@@ -10,6 +10,9 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 
 ### Latest Updates (February 2026)
 - **[PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md)** - ⭐ NEW: 250 Hz, restitution, friction cones, vectorization
+- **[JOINT_CONSTRAINTS.md](JOINT_CONSTRAINTS.md)** - ⭐ NEW: Realistic joint types (revolute, spherical, fixed, hinge2, prismatic)
+- **[JOINT_CONSTRAINTS_INTEGRATION.md](JOINT_CONSTRAINTS_INTEGRATION.md)** - ⭐ NEW: How to enable joint constraints in your simulation
+- **[JOINT_CONSTRAINTS_EXAMPLES.md](JOINT_CONSTRAINTS_EXAMPLES.md)** - ⭐ NEW: Copy-paste examples and troubleshooting
 - **[ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md)** - How we compare to NVIDIA Isaac Gym standard
 - **[QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md)** - Quadruped architecture, 12 DOF forward kinematics, balance-focused rewards
 - **[PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md)** - Improved physics (gravity integration, spring-damper contacts, velocity clamping, agent-centered world)
@@ -40,6 +43,9 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 ### "I want to start training NOW"
 → [PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md) (2 min, copy preset, done!)
 
+### "I want realistic joint constraints"
+→ [JOINT_CONSTRAINTS_EXAMPLES.md](JOINT_CONSTRAINTS_EXAMPLES.md) (5 min, 4 lines of code!)
+
 ### "I want to understand the physics system"
 → [PHYSICS_FUNDAMENTALS.md](PHYSICS_FUNDAMENTALS.md) (overview) → [PHYSICS_ENGINE_DESIGN.md](PHYSICS_ENGINE_DESIGN.md) (architecture)
 
@@ -57,13 +63,16 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 | CONFIGURATION.md | All parameters, physics tuning, reward weights |
 | **QUADRUPED_BALANCE_TASK.md** | **Quadruped design, 4 legs × 3 joints, forward kinematics, balance task** |
 | **PHYSICS_AND_WORLD.md** | **Gravity integration, spring-damper contacts, joint velocity limits, agent-centered world** |
+| **JOINT_CONSTRAINTS.md** | **Joint types (revolute, spherical, fixed, hinge2, prismatic), physics parameters, tuning** |
+| **JOINT_CONSTRAINTS_INTEGRATION.md** | **How to enable constraints in PhysicsEngine, configuration patterns** |
+| **JOINT_CONSTRAINTS_EXAMPLES.md** | **Copy-paste code examples, before/after comparison, troubleshooting** |
 | AGENT_SYSTEM.md | Neural networks, motor control, policy/value heads |
 | WORLD_SYSTEM.md | Physics engine, reward computation, mechanics |
 | ARCHITECTURE.md | 5-class modular design (Environment, PhysicsEngine, Renderer, TrainingEngine, System) |
 | WORLD_MODEL.md | DreamerV3 world model, dynamics learning |
 | PERFORMANCE.md | Optimization, JIT kernel fusion, profiling |
 
-**Total: ~4000 lines of comprehensive documentation**
+**Total: ~4500 lines of comprehensive documentation**
 
 ## 🔗 Related Resources
 
