@@ -98,4 +98,22 @@ python train.py
 # Now you have both checkpoint/model.pt (new) and checkpoint/model_baseline.pt (old)
 ```
 
+## Training Diagnostics
+
+The `training.log` file provides detailed diagnostics to monitor learning quality:
+
+### 1. PPO Metrics
+- **Episode Return**: Cumulative reward for the episode.
+- **Value Loss**: Accuracy of reward prediction.
+- **Entropy**: Policy diversity (high = exploring, low = converging).
+- **KL Divergence**: Change in policy between updates (should be small, < 0.02).
+- **Clip Fraction**: Percentage of updates capped by PPO clipping.
+
+### 2. Physical Metrics
+- **Joint Saturation Rate**: Percentage of time joints hit the ±10 rad/s limit. High rates suggest jerky, unstable motion.
+- **Contact Stats**: Mean contact intensity per foot.
+- **All 4 Contact Frequency**: How often the agent is standing securely on all legs.
+- **Action Mean/Std**: Distribution of motor torques per joint.
+
+
 See [CONFIGURATION.md](CONFIGURATION.md) for more details on checkpoint settings.

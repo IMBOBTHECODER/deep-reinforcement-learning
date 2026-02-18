@@ -8,22 +8,22 @@ class Config:
     
     # Core training parameters
     DIM = (64, 32, 64)  # World dimensions (larger for balance task)
-    MAX_STEPS_PER_EPISODE = 1000
+    MAX_STEPS_PER_EPISODE = 1024
     MAX_TRAINING_EPISODES = 50
     LOAD_CHECKPOINT = False
     CHECKPOINT_DIR = Path("checkpoint")
     
     # ============ VECTORIZED MULTI-ENVIRONMENT TRAINING ============
-    USE_VECTORIZED_ENV = True
+    # Always enabled: Multiple agents train in parallel for efficiency
     NUM_ENVS = None  # Auto-detect based on available memory
-    MAX_ENVS = 64
+    MAX_ENVS = 8
     MIN_ENVS = 2
     MAX_DATA_THRESHOLD_MB = 8192
     
-    # Memory model updated for quadruped observation (37D)
-    # Observation: (1, 37) float32 = 148 bytes per observation
-    OBS_BYTES = 148  # (1, 37) float32 quadruped observation
-    PER_STEP_BYTES = 300  # obs + action(12) + logprob + value + reward + done + buffers
+    # Memory model updated for quadruped observation (34D)
+    # Observation: (1, 34) float32 = 136 bytes per observation
+    OBS_BYTES = 136  # (1, 34) float32 quadruped observation
+    PER_STEP_BYTES = 280  # obs + action(12) + logprob + value + reward + done + buffers
     ROLLOUT_STEPS = 256
     MEMORY_OVERHEAD_MB = 256
     
@@ -61,8 +61,16 @@ class Config:
     VALUE_CLIP_RANGE = 0.2  # Clip value function updates
     
     # ============ MULTI-CORE PROCESSING ============
-    # Physics processing distributed across CPU cores
+    # Always enabled: CPU threads handle physics when GPU not available
     NUM_PHYSICS_THREADS = None  # None = auto-detect (typically num_cpus - 1)
+    PHYSICS_BATCH_SIZE = 4  # Physics steps batched together per thread
+    
+    # ============ GPU ACCELERATION & VECTORIZATION (Numba CUDA) ============
+    # Phase 4b: GPU-accelerated vectorized physics for 1000+ environments
+    GPU_THREADS_PER_BLOCK = 1024  # Threads per block (1024 for RTX cards, 512 for older)
+    GPU_MAX_BLOCKS = 32  # Maximum thread blocks for occupancy
+    VECTORIZED_PHYSICS = True  # Enable batched physics kernel (1000+ envs on GPU)
+    VECTORIZED_BATCH_SIZE = 1024  # Batch size for GPU physics (environments per kernel call)
     
     # ============ BALANCE TASK REWARD SHAPING ============
     # Goal: Keep center of mass (COM) close to goal position
@@ -82,7 +90,7 @@ class Config:
     
     # ============ PHYSICS SYSTEM - QUADRUPED ============
     # Physics parameters (tuned for stability)
-    DT = 0.01  # Timestep: 100 Hz physics simulation
+    DT = 0.004  # Timestep: 250 Hz simulation (upgraded from 100 Hz for finer contact resolution)
     JOINT_DAMPING = 0.1  # Increased damping for smoother motion
     MAX_TORQUE = 5.0  # Maximum motor torque (N*m)
     SEGMENT_LENGTH = 0.1  # Length of each leg segment (3 segments = 0.3m leg)
@@ -94,10 +102,31 @@ class Config:
     GROUND_FRICTION_COEFFICIENT = 0.9  # Rubber/bio pads on concrete
     FOOT_HEIGHT_THRESHOLD = 0.05  # Distance below ground to register contact
     
-    # Contact physics (spring-damper model)
+    # Contact physics (spring-damper model with restitution & friction cones)
     CONTACT_STIFFNESS = 500.0  # Stiff ground (concrete-like, N/m per foot)
     CONTACT_DAMPING = 0.15  # Ground damping (realistic for impact)
-    CONTACT_RESTITUTION = 0.1  # Very low bounce (Earth materials)
+    CONTACT_RESTITUTION = 0.1  # Coefficient of restitution (0=no bounce, 1=perfect). 0.1 = slight bounce
+    
+    # ============ FRICTION CONES (Phase 3: Directional Friction Constraint) ============
+    # Friction cone prevents unrealistic sliding: ||F_tangent|| <= mu * F_normal
+    USE_FRICTION_CONES = True  # Enable 3D friction cones (prevents sideways sliding)
+    FRICTION_CONE_DAMPING = 0.3  # Additional damping within friction cone for numerical stability
+    
+    # ============ ACTUATOR DYNAMICS (Phase 1 Realism Improvement) ============
+    # First-order response lag: τ_actual = τ_actual + (τ_commanded - τ_actual) * (dt / τ_response)
+    ACTUATOR_RESPONSE_TIME = 0.01  # seconds (10ms lag, typical for servo motors)
+    # If 0.0, disabled (direct torque application, legacy behavior)
+    
+    # ============ FRICTION MODEL (Phase 2 Realism Improvement) ============
+    FRICTION_MODEL = "coulomb+viscous"  # Options: "simple" (legacy), "coulomb", "coulomb+viscous"
+    FRICTION_COEFFICIENT_STATIC = 0.9   # μ_s: resistance to initial slip
+    FRICTION_COEFFICIENT_KINETIC = 0.85  # μ_k: resistance during active slip (slightly lower)
+    FRICTION_VISCOUS_DAMPING = 0.05  # η: viscous damping during slip (N·s/m)
+    FRICTION_SLIP_VELOCITY_THRESHOLD = 0.01  # m/s: transition between static/kinetic
+    
+    # ============ ENERGY ACCOUNTING (Phase 4 Strategic Improvement) ============
+    TRACK_ENERGY_CONSUMPTION = True  # If True, accumulate electrical energy spent
+    MOTOR_EFFICIENCY = 0.80  # Mechanical efficiency: 0-100%, typical servos 60-90%
     
     # Rigid body properties
     BODY_MASS = 5.0  # kg, quadruped torso mass

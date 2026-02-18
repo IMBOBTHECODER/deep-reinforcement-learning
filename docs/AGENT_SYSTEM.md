@@ -21,7 +21,7 @@ The quadruped learns through deep reinforcement learning (PPO) to maintain balan
     FL    |    FR
      |\   |   /|
      | \  |  / |   Front-Left (FL): Leg 0
-     |  Body  |    Front-Right (FR): Leg 1
+     |   Body  |    Front-Right (FR): Leg 1
      | /  |  \ |    Back-Left (BL): Leg 2
      |/   |   \|    Back-Right (BR): Leg 3
     BL    |    BR
@@ -38,54 +38,137 @@ The quadruped learns through deep reinforcement learning (PPO) to maintain balan
 
 #### 2. Feature Encoder
 Extracts meaningful patterns from agent state and observations:
-- **Input**: 37D observations (agent-centered coordinates)
+- **Input**: 34D observations (agent-centered coordinates)
   - 12D: Joint angles [θ₁-θ₁₂]
   - 12D: Joint velocities [ω₁-ω₁₂]
   - 4D: Foot contact states [c₁-c₄] (continuous, 0-1)
   - 3D: Body orientation [roll, pitch, yaw]
-  - 3D: COM position (zeros in agent-centered frame)
   - 3D: Goal relative position [Δx, Δy, Δz]
-- **Processing**: 2-layer MLP
-  - Input: 37 → Hidden: 256 → Hidden: 256
+- **Processing**: 2-layer MLP (Linear → ReLU → Linear)
+  - Layer 1: 34 → 256 (with ReLU activation)
+  - Layer 2: 256 → 128 (no activation, output)
   - Output: 128-dim encoded features
-  - Activation: ReLU between layers, none at output
+
+```python
+# In entity.py (Encoder class)
+self.net = nn.Sequential(
+    nn.Linear(34, 256),
+    nn.ReLU(),
+    nn.Linear(256, 128)   # 128D embedding
+)
+```
+
+#### 3. Feature Projection (Baseline Architecture)
+Simple linear projection from encoder to LSTM:
+- **Input**: Encoded features (128D)
+- **Processing**: Linear transformation without activation
+- **Output**: 256D (LSTM input dimension)
+- **Rationale**: Clean, interpretable baseline for training. Avoids premature optimization before establishing working system.
 
 ```python
 # In entity.py (EntityBelief class)
-self.fc1 = nn.Linear(37, 256)    # 37D observation
-self.fc2 = nn.Linear(256, 256)
-self.fc3 = nn.Linear(256, 128)   # 128D embedding
+self.feature_projection = nn.Linear(embed_dim=128, lstm_hidden=256)
+projection_t = self.feature_projection(encoder_features)  # (N, 256)
 ```
 
-#### 3. LSTM (Long Short-Term Memory)
+**Why This Design:**
+- **Simplicity**: Single linear layer is easy to debug and understand
+- **Efficiency**: No graph overhead or attention computation
+- **Effectiveness**: For N=1 creature per env (current setup), explicit message-passing is unnecessary
+- **Future-Ready**: Clear upgrade path to real graph attention (see Option B below)
+
+**Option B (Future): 12-Node Kinematic Graph Attention**
+
+If joint-dependency learning becomes critical, replace `feature_projection` with a full graph attention network:
+
+**Graph Structure**:
+- **Nodes**: 12 (3 per leg × 4 legs)
+  - Leg 0 (FL): nodes 0 (hip), 1 (knee), 2 (ankle)
+  - Leg 1 (FR): nodes 3, 4, 5
+  - Leg 2 (BL): nodes 6, 7, 8
+  - Leg 3 (BR): nodes 9, 10, 11
+
+- **Kinematic Chain Edges** (within-leg only):
+  - Per leg: 2 undirected links (hip↔knee, knee↔ankle) → 4 directed edges if bidirectional
+  - All legs: 4 × 4 directed = 16 directed edges
+  - Optional cross-leg coordination: Front legs ↔ back legs (2-4 edges) for synchronized gaits
+  - **Total: 16-20 directed edges**
+
+- **Full edge_index tensor** (16 kinematic chain edges):
+```python
+# 12 nodes: 0,1,2=FL; 3,4,5=FR; 6,7,8=BL; 9,10,11=BR
+# Kinematic edges (bidirectional within legs):
+edge_index = torch.tensor(
+    [[0,1, 1,0, 1,2, 2,1,      # FL: hip↔knee, knee↔ankle
+      3,4, 4,3, 4,5, 5,4,      # FR: hip↔knee, knee↔ankle
+      6,7, 7,6, 7,8, 8,7,      # BL: hip↔knee, knee↔ankle
+      9,10, 10,9, 10,11, 11,10],  # BR: hip↔knee, knee↔ankle
+     [1,0, 0,1, 2,1, 1,2,      # Sources above → destinations below
+      4,3, 3,4, 5,4, 4,5,
+      7,6, 6,7, 8,7, 7,8,
+      10,9, 9,10, 11,10, 10,11]],
+    dtype=torch.long)  # (2, 16)
+```
+
+**GAT Implementation** (if needed):
+```python
+# Replace self.feature_projection with:
+self.gat = MultiHeadGraphAttention(
+    in_dim=128, out_dim=256, num_heads=4,
+    edge_index=edge_index_kinematic_chain
+)
+projection_t = self.gat(encoder_features)  # (N, 256)
+```
+
+**Benefits of Option B**:
+- Explicit kinematic constraints: Joint dependencies learned via structure
+- Better generalization: Graph symmetries (4-fold leg invariance) encoded in attention
+- Interpretability: Attention weights show which joints influence decisions
+- Scalability: Extends naturally to more complex morphologies
+
+**Trade-off**: ~10-100× more compute in attention (not critical for current 1-creature-per-env training)
+
+#### 4. LSTM (Long Short-Term Memory)
 Maintains temporal state for sequential decision-making:
+- **Input**: Feature projection output (256D from linear transformation)
 - **Hidden Size**: 256 units (increased for complex motor control)
-- **Layers**: 1 bidirectional
-- **Purpose**: Remember previous actions and states, learn smooth motion sequences
-- **Input**: Encoded features (128D) + previous action (12D)
+- **Layers**: 1 unidirectional (LSTMCell for causal policy learning)
 - **Output**: LSTM hidden state (256D used for policy/value heads)
+- **Purpose**: Remember previous actions and states, learn smooth motion sequences
+- **Design**: Uses LSTMCell (not LSTM) for online RL - processes one timestep at a time, maintains causality
 
 ```python
-# LSTM state tracking
-self.lstm = nn.LSTM(input_size=128, hidden_size=256, batch_first=True)
-rnn_state_new = lstm(features, rnn_state_old)
-# Output: (batch_size, seq_len, 256)
+# LSTM state tracking (in entity.py)
+self.lstm = nn.LSTMCell(input_size=256, hidden_size=256)  # 256D input from feature projection
+h_t, c_t = self.lstm(projection_features, (h_prev, c_prev))
+# Output: h_t (N, 256), c_t (N, 256) - single timestep processing
 ```
 
-#### 4. Policy Head - 12D Motor Torque Generation
+**Signal Flow**:
+- 34D observation → Encoder(256 hidden) → 128D features
+- 128D features → Feature projection (Linear) → 256D
+- 256D → LSTMCell → 256D hidden state
+- 256D hidden → Policy/Value heads
+
+**Why unidirectional (LSTMCell)?**
+- RL requires causal processing: only past observations affect actions, not future ones
+- Bidirectional LSTM would create train-test mismatch (future data available during training, not during deployment)
+- LSTMCell processes one step at a time, perfect for online RL with continuous state updates
+
+#### 5. Policy Head - 12D Motor Torque Generation
 Generates motor control signals for all 12 joints:
 - **Input**: LSTM hidden state (256D)
 - **Output**: Mean torques (μ) for 12 joints
-- **Activation**: Tanh to bound actions to [-1, 1]
-- **Range after scaling**: [-5, 5] N⋅m per motor (in PhysicsEngine)
+- **Activation**: None (pure Gaussian in $\mathbb{R}$)
+- **Range after scaling**: Naturally capped to [-5, 5] N⋅m per motor (in PhysicsEngine)
 - **Distribution**: Gaussian with learned per-action standard deviation
-- **Benefit**: Continuous differentiable control
+- **Benefit**: More stable for PPO; avoids tanh saturation problems
 
 ```python
 # Policy head computation
 self.policy_head = nn.Linear(256, 12)   # 256D → 12D motor torques
-action_mean = torch.tanh(self.policy_head(rnn_state))  # [-1, 1]
-# Scaled to [-5, 5] N*m in training loop
+action_mean = self.policy_head(rnn_state)  # Pure Gaussian in R
+# Clamped to [-5, 5] N*m in PhysicsEngine for safety
 action_noise = torch.randn_like(action_mean)
 action = action_mean + exp(log_std) * action_noise  # Reparameterization
 ```
@@ -113,11 +196,11 @@ value = self.value_head(rnn_state)   # Unbounded output
 ### Neural Network Full Architecture
 
 ```
-INPUT OBSERVATION (37D)
+INPUT OBSERVATION (34D)
     ↓
 ┌───────────────────────────┐
 │  Feature Encoder (2 MLP)  │
-│   37 → 256 → 256 → 128   │
+│   34 → 256 → 256 → 128   │
 │  (Learned feature extraction)
 └────────────┬────────────┘
              ↓
@@ -196,7 +279,7 @@ creature.velocity.z -= GRAVITY * gravity_factor * dt
 
 This enables natural balance learning without explicit balance rewards.
 
-## Observation Space (37D, Agent-Centered)
+## Observation Space (34D, Agent-Centered)
 
 The agent perceives the world in agent-centered coordinates (agent always at origin):
 
@@ -206,8 +289,7 @@ The agent perceives the world in agent-centered coordinates (agent always at ori
 | 12-23 | 12D | `joint_velocities` | [-10, 10] | Velocities for all 12 joints (rad/s) |
 | 24-27 | 4D | `foot_contacts` | [0, 1] | Contact state per foot (continuous) |
 | 28-30 | 3D | `orientation` | [-π, π] | Body roll, pitch, yaw |
-| 31-33 | 3D | `com_position` | [0, 0, 0] | Center of mass (always zero in agent frame) |
-| 34-36 | 3D | `goal_relative` | [-∞, ∞] | Goal position relative to agent (Δx, Δy, Δz) |
+| 31-33 | 3D | `goal_relative` | [-∞, ∞] | Goal position relative to agent (Δx, Δy, Δz) |
 
 **Agent-Centered Coordinates:**
 All observations are automatically transformed to agent-local frame:
@@ -238,32 +320,68 @@ Motor torques control all 12 joints directly:
 
 **Action Generation:**
 ```python
-# Policy network outputs tanh-bounded actions
-action_logits = policy_head(rnn_state)  # (batch, 12)
-action_tanh = torch.tanh(action_logits)  # (batch, 12) in [-1, 1]
+# Policy network outputs mean torques (unbounded)
+mu = policy_head(rnn_state)  # (batch, 12) in R^12 (unbounded)
 
-# Scale to motor torque range
-action_scaled = action_tanh * MAX_TORQUE  # (batch, 12) in [-5, 5] N·m
+# Gaussian sampling with learned per-action std
+log_std = learned_parameter  # (12,) learned during training
+std = torch.exp(log_std)
+action = mu + std * torch.randn_like(mu)  # (batch, 12) Gaussian in R^12
 
-# Add exploration noise during training
-log_std = torch.tensor([...]  # Learned per-action
-action_sampled = action_scaled + exp(log_std) * randn_like(action_scaled)
+# Physics engine clamps to [-5, 5] N·m as safety guard
+# (rarely triggered if policy learns reasonable range)
+motor_torques = torch.clamp(action, -5.0, 5.0)
 ```
 
-**Log Probability Calculation:**
+**Log Probability Calculation (Pure Gaussian in ℝ):**
 ```python
-# Gaussian log probability for 12D action
-log_prob = -0.5 * (((action - mu) / sigma) ** 2).sum(dim=-1)
-log_prob -= 0.5 * 12 * math.log(2 * math.pi)  # 12D Gaussian term
-log_prob -= log_std.sum()  # Jacobian for tanh transformation
+# Gaussian log probability for 12D action (no tanh correction)
+log_prob = -0.5 * (((action - mu) / std) ** 2).sum(dim=-1)
+log_prob -= 0.5 * 12 * math.log(2 * math.pi)  # 12D normalization constant
+log_prob -= log_std.sum()  # log(|det(I)|) = sum of log std deviations
+
+# Note: log_prob computed on sampled action BEFORE clamp
+# Clamp happens only as safety guard in physics engine
+# Monitor action_clamp_fraction to ensure clamp rarely triggers
 ```
+
+**Action Clamping & Safety Trade-Off:**
+
+The policy learns unbounded 12D Gaussian actions in ℝ, which are clamped to [-5, 5] N·m per motor in the physics engine:
+
+```python
+# Physics engine applies safety clamp
+motor_torques = torch.clamp(action, -5.0, 5.0)
+```
+
+**Important invariant**: Log-probabilities are computed on the **unclipped action** sampled from the policy. This is mathematically correct because:
+
+1. **Policy distribution**: $a \sim \mathcal{N}(\mu, \sigma^2)$ over ℝ¹²
+2. **Log-prob computed on**: The raw sample $a$ before clamping
+3. **Execution uses**: Clamped $\text{clamp}(a, -5, 5)$ for safety
+
+**When is this valid?**
+- ✅ If clamping rarely happens (< 1% of steps): Policy learned the range correctly
+- ✅ PPO weight update still uses correct log-probs from high-likelihood region
+- ❌ If clamping happens frequently (> 10%): Indicates policy exploring harmful region, learning breaks
+
+**Diagnostics**: Monitor `action_clamp_fraction` in training logs:
+- `action_clamp_fraction=0.00%` → Policy stays in safe range ✓
+- `action_clamp_fraction=5.00%` → Some actions clipped, check if learning is degrading
+- `action_clamp_fraction>10%` → Learning is broken, reduce exploration or adjust reward
+
+**Example log output:**
+```
+Ep 42: reward=15.3, entropy=0.82, clip=0.08, action_clamp=0.8%
+```
+This indicates healthy learning - 99.2% of action dimensions are within [-5, 5].
 
 ## Learning Process - PPO (Proximal Policy Optimization)
 
 ### Data Collection Phase
 
 For each environment:
-1. Agent observes state s_t (37D)
+1. Agent observes state s_t (34D)
 2. Policy generates action a_t (12D motor torques)
 3. PhysicsEngine executes action, returns:
    - next_state s_{t+1}
@@ -276,7 +394,7 @@ For each environment:
 ```python
 # In collect_trajectory()
 for step in range(MAX_STEPS_PER_EPISODE):
-    obs = env.observe()  # (1, 37)
+    obs = env.observe()  # (1, 34)
     action_mean, action_logstd = policy.forward(obs)
     action = action_mean + exp(action_logstd) * randn_like(action_mean)
     
@@ -562,23 +680,26 @@ creature.rnn_state = None  # Initialize fresh RNN state
 ## Observation Processing Pipeline
 
 ```
-Raw 7D Obs
+34D Observation
     ↓
-[Encoder: 7→256→256→128]
+[Encoder: 2-layer MLP]
+[34 → 256 → 256 → 128]
     ↓
-128-dim Features
+128D Encoded Features
     ↓
-[GAT: 4-head attention]
+[Feature Projection: Linear transformation]
+[Linear(128 → 256)]
     ↓
-128-dim Attended Features
+256D Projected Features
     ↓
-[LSTM: Process temporal]
+[LSTM: Temporal memory]
+[LSTMCell: 256 → 256 hidden]
     ↓
-128-dim Hidden State
+256D Hidden State
     ↓
-    ├→ [Policy Head] → μ_action
-    ├→ [Value Head] → V(state)
-    └→ [Action Sample] → action
+    ├→ [Policy Head] → μ_action (12D)
+    ├→ [Value Head] → V(state) (1D)
+    └→ [log_std] → σ (12D)
 ```
 
 ## Agent Capabilities & Limitations
@@ -586,7 +707,7 @@ Raw 7D Obs
 ### Capabilities
 ✅ Continuous movement in 3D
 ✅ Long-horizon planning (LSTM)
-✅ Spatial reasoning (GAT)
+✅ Spatial reasoning (future: Option B with graph attention)
 ✅ Energy-aware decision-making
 ✅ Multi-goal navigation
 ✅ Obstacle avoidance

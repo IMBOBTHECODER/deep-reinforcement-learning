@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import Config
 
-from .entity import EntityBelief, Creature, Encoder, SimpleGATLayer, init_single_creature
+from .entity import EntityBelief, Creature, Encoder, init_single_creature
 from .simulate import System
 
 __all__ = [
@@ -15,7 +15,6 @@ __all__ = [
     "EntityBelief",
     "Creature",
     "Encoder",
-    "SimpleGATLayer",
     "init_single_creature",
     "System",
     "HelperMath",

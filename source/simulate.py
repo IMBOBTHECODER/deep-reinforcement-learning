@@ -293,13 +293,10 @@ class Environment:
         self.goal_pos_t = torch.tensor([float(self.w - 5), float(self.h - 5), float(self.d - 1)], device=device, dtype=dtype)
         
         # Multi-environment support
-        self.use_vectorized = Config.USE_VECTORIZED_ENV
-        self.num_envs = Config.NUM_ENVS if Config.NUM_ENVS is not None else detect_available_envs() if Config.USE_VECTORIZED_ENV else 1
-        
-        if self.use_vectorized:
-            logger.info(f"Vectorized environment enabled with {self.num_envs} parallel environments")
-        else:
-            logger.info("Single environment training")
+        self.use_vectorized = True
+        self.num_envs = Config.NUM_ENVS if Config.NUM_ENVS is not None else detect_available_envs()
+
+        logger.info(f"Vectorized environment enabled with {self.num_envs} parallel environments")
         
         # Creature management
         self.creatures = []  # List[Creature] one per environment
@@ -345,10 +342,10 @@ class Environment:
     
     def observe(self, creature):
         """
-        Observation for quadruped in AGENT-CENTERED WORLD (37D total).
+        Observation for quadruped in AGENT-CENTERED WORLD (34D total).
         See docs/QUADRUPED_BALANCE_TASK.md for component breakdown.
         
-        Returns: (1, 37) tensor
+        Returns: (1, 34) tensor
         """
         from .entity import compute_center_of_mass
         
@@ -357,11 +354,10 @@ class Environment:
             creature.joint_velocities,                                # (12,)
             creature.foot_contact,                                    # (4,)
             creature.orientation,                                     # (3,)
-            torch.zeros(3, device=self.device, dtype=self.dtype),   # (3,) COM at origin in local frame
             self.goal_pos_t - creature.pos                           # (3,) goal relative to agent
         ]
         
-        obs = torch.cat(obs_list).unsqueeze(0).to(self.device)  # (1, 37)
+        obs = torch.cat(obs_list).unsqueeze(0).to(self.device)  # (1, 34)
         return obs
 
 
@@ -374,9 +370,9 @@ class TrainingEngine:
         self.env = environment
         self.physics = physics_engine
         
-        # RL models - QUADRUPED (37D observation, 12D motor torques)
-        # WARNING: OBS_DIM=37 and ACTION_DIM=12 are hardcoded; changes affect multiple modules
-        NN_OBS_DIM = 37
+        # RL models - QUADRUPED (34D observation, 12D motor torques)
+        # WARNING: OBS_DIM=34 and ACTION_DIM=12 are hardcoded; changes affect multiple modules
+        NN_OBS_DIM = 34
         NN_NUM_ACTIONS = 12
         
         self.model = EntityBelief(
@@ -536,16 +532,17 @@ class TrainingEngine:
                         obs_batch, edge_idx, prev_state=(h_batch, c_batch)
                     )
                     
-                    # Sample actions
+                    # Sample actions (Gaussian in R^12, no tanh in policy)
                     std = torch.exp(log_std)
-                    u = mu + torch.randn_like(mu) * std
-                    actions = torch.tanh(u)  # (batch, 12)
+                    actions = mu + torch.randn_like(mu) * std  # (batch, 12)
                     
-                    # Compute log probs
-                    log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
-                    log_prob_gaussian = log_prob_gaussian - log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI
-                    tanh_correction = -torch.log(1.0 - actions ** 2 + self.log_eps).sum(dim=1)
-                    log_probs = log_prob_gaussian + tanh_correction
+                    # Compute log probs for Gaussian
+                    log_probs = -0.5 * ((actions - mu) ** 2 / (std ** 2)).sum(dim=1)
+                    log_probs = log_probs - log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI
+                    
+                    # Track which actions would be clamped (for diagnostics)
+                    actions_clamped = (torch.abs(actions) > 5.0).float()  # (batch, 12)
+                    clamp_fraction = actions_clamped.mean().item()  # Fraction of components exceeding [-5, 5]
                     
                     # Collect creatures and actions for parallel reward computation
                     active_creatures = []
@@ -557,7 +554,10 @@ class TrainingEngine:
                     for env_id in range(num_envs):
                         if step_counts[env_id] < max_steps:
                             creature = self.env.creatures[env_id]
-                            motor_torques = actions[env_id_active:env_id_active+1][0] * 5.0
+                            # Gaussian → clamp/scale torques
+                            # Actions are in R, physics clamps them to [-MAX_TORQUE, MAX_TORQUE]
+                            # We can scale them if needed, but let's assume mu/std learn the range
+                            motor_torques = actions[env_id_active] # (12,)
                             active_creatures.append(creature)
                             active_actions.append(motor_torques)
                             active_rnn_states.append(creature.rnn_state)
@@ -613,6 +613,9 @@ class TrainingEngine:
                                 'next_value': next_value.squeeze().detach(),
                                 'done': float(done),
                                 'old_log_prob': log_prob_i.detach(),
+                                'joint_vels': creature.joint_velocities.detach().clone(),
+                                'foot_contacts': creature.foot_contact.detach().clone(),
+                                'action_clamped': actions_clamped[env_id_active],  # Track clamp per step
                             })
                             
                             step_counts[env_id] += 1
@@ -694,25 +697,25 @@ class TrainingEngine:
             # Get observation
             obs = self.env.observe(creature)
             
-            # Get action from policy (12D motor torques)
+            # Get action from policy (Gaussian in R^12, no tanh in policy)
             with torch.no_grad():
                 (mu, log_std), value, new_state = self.model(obs, edge_idx, prev_state=creature.rnn_state)
             
             creature.rnn_state = new_state
             
-            # Sample action from policy (tanh-squashed Gaussian)
+            # Sample action (Gaussian)
             std = torch.exp(log_std)
-            u = mu + torch.randn_like(mu) * std
-            action = torch.tanh(u)  # (1, 12) squashed to [-1, 1]
+            action = mu + torch.randn_like(mu) * std # (1, 12)
             
             # Compute log probability
-            log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
-            log_prob_gaussian = log_prob_gaussian - log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI
-            tanh_correction = -torch.log(1.0 - action ** 2 + self.log_eps).sum(dim=1)
-            log_prob = log_prob_gaussian + tanh_correction
+            log_prob = -0.5 * ((action - mu) ** 2 / (std ** 2)).sum(dim=1)
+            log_prob = log_prob - log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI
             
-            # Scale action to motor torques ([-5, 5] N*m range)
-            motor_torques = action[0] * 5.0  # (12,) scaled torques
+            # Track which action components exceed the clamp threshold
+            action_clamped = (torch.abs(action) > 5.0).float()  # (1, 12)
+            
+            # Physics clamps the torques anyway
+            motor_torques = action[0] # (12,)
             
             # Apply physics and get reward
             reward, com_dist, stability_metrics = self.physics._compute_reward(
@@ -746,6 +749,9 @@ class TrainingEngine:
                 'next_value': next_value.squeeze().detach(),
                 'done': float(done),
                 'old_log_prob': log_prob[0].detach(),
+                'joint_vels': creature.joint_velocities.detach().clone(),
+                'foot_contacts': creature.foot_contact.detach().clone(),
+                'action_clamped': action_clamped.squeeze(),  # Track clamp per step
             })
             
             step_count += 1
@@ -808,24 +814,21 @@ class TrainingEngine:
                 value_seq = torch.cat(value_list, dim=0)
                 
                 action_batch = torch.cat(action_list, dim=0)  # (T, 12)
-                mu = mu_seq
                 std = torch.exp(log_std_seq)
                 
-                # Stable atanh for 12D action space
-                a = torch.clamp(action_batch, -1.0 + self.physics.atanh_eps, 1.0 - self.physics.atanh_eps)
-                u = 0.5 * (torch.log1p(a) - torch.log1p(-a))
+                # Log probability for 12D Gaussian policy (no tanh)
+                log_prob_seq = -0.5 * ((action_batch - mu_seq) ** 2 / (std ** 2)).sum(dim=1)
+                log_prob_seq = log_prob_seq - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
                 
-                # Log probability for 12D Gaussian policy
-                log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
-                log_prob_gaussian = log_prob_gaussian - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI  # 12D
+                with torch.no_grad():
+                    log_ratio = log_prob_seq - old_log_probs
+                    kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
                 
-                # Tanh correction for 12D
-                tanh_correction = -torch.log(1.0 - action_batch ** 2 + self.physics.log_eps).sum(dim=1)
-                log_prob_seq = log_prob_gaussian + tanh_correction
-                
-                ratio = torch.exp(log_prob_seq - old_log_probs)
+                ratio = torch.exp(log_ratio)
                 clipped_ratio = torch.clamp(ratio, 1.0 - Config.PPO_CLIP_RATIO, 1.0 + Config.PPO_CLIP_RATIO)
                 policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+                
+                clip_frac = (torch.abs(ratio - 1.0) > Config.PPO_CLIP_RATIO).float().mean()
                 
                 v_pred = value_seq.squeeze()
                 v_old = values.squeeze().detach()
@@ -841,10 +844,27 @@ class TrainingEngine:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
         
+        # Diagnostics
+        with torch.no_grad():
+            joint_vels = torch.stack([t['joint_vels'] for t in trajectory]) # (T, 12)
+            sat_rate = (torch.abs(joint_vels) >= 10.0).float().mean()
+            
+            contacts = torch.stack([t['foot_contacts'] for t in trajectory]) # (T, 4)
+            mean_contacts = contacts.mean(dim=0)
+            all_4_freq = (contacts.sum(dim=1) == 4.0).float().mean()
+            
+            action_clamp = torch.stack([t['action_clamped'] for t in trajectory])  # (T, 12)
+            clamp_frac = action_clamp.mean().item()
+            
+            action_mean = action_batch.mean(dim=0)
+            action_std = action_batch.std(dim=0)
+
         episode_reward = sum(float(t['reward']) for t in trajectory)
         self.episode_rewards.append(episode_reward)
-        msg = f"Ep {self.episode_count}: reward={episode_reward:.2f}, policy_loss={policy_loss.item():.4f}, value_loss={value_loss.item():.4f}"
+        msg = f"Ep {self.episode_count}: reward={episode_reward:.2f}, policy_loss={policy_loss.item():.4f}, value_loss={value_loss.item():.4f}, entropy={entropy.item():.4f}, KL={kl.item():.4f}, clip={clip_frac.item():.4f}, action_clamp={clamp_frac:.2%}"
         logger.info(msg)
+        logger.info(f"  Actions: mean={action_mean.mean().item():.3f}, std={action_std.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}")
+        logger.info(f"  Contacts: {mean_contacts.tolist()} | All4 Freq: {all_4_freq.item():.2%}")
         print(msg)
     
     def train_on_trajectories_batch(self, trajectories_wrapped):
@@ -884,7 +904,10 @@ class TrainingEngine:
         all_old_log_probs = []
         all_obs = []
         all_actions = []
-        all_edge_indices = []  # NEW: Store edge indices aligned with trajectories
+        all_edge_indices = []
+        all_joint_vels = []
+        all_foot_contacts = []
+        all_action_clamps = []
         
         for traj_data in trajectories_wrapped:
             trajectory = traj_data['trajectory']
@@ -897,6 +920,9 @@ class TrainingEngine:
             old_log_probs = torch.cat([t['old_log_prob'].unsqueeze(0) for t in trajectory])
             obs_list = [t['obs'] for t in trajectory]
             action_list = [t['action'] for t in trajectory]
+            joint_vels = torch.stack([t['joint_vels'] for t in trajectory])
+            foot_contacts = torch.stack([t['foot_contacts'] for t in trajectory])
+            action_clamps = torch.stack([t['action_clamped'] for t in trajectory])
             
             all_rewards.append(rewards)
             all_values.append(values)
@@ -905,7 +931,10 @@ class TrainingEngine:
             all_old_log_probs.append(old_log_probs)
             all_obs.append(obs_list)
             all_actions.append(action_list)
-            all_edge_indices.append(edge_idx)  # NEW: Store edge index for this trajectory
+            all_edge_indices.append(edge_idx)
+            all_joint_vels.append(joint_vels)
+            all_foot_contacts.append(foot_contacts)
+            all_action_clamps.append(action_clamps)
         
         rewards_batch = torch.cat(all_rewards)
         values_batch = torch.cat(all_values)
@@ -968,63 +997,19 @@ class TrainingEngine:
                 mu = mu_seq
                 std = torch.exp(log_std_seq)
                 
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] mu: min={mu.min():.6f}, max={mu.max():.6f}, has_nan={torch.isnan(mu).any()}")
-                    logger.info(f"[EPOCH {epoch}] std: min={std.min():.6f}, max={std.max():.6f}, has_nan={torch.isnan(std).any()}")
+                # Log probability for 12D Gaussian policy (no tanh)
+                log_prob_seq = -0.5 * ((action_batch - mu) ** 2 / (std ** 2)).sum(dim=1)
+                log_prob_seq = log_prob_seq - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
                 
-                a = torch.clamp(action_batch, -1.0 + self.physics.atanh_eps, 1.0 - self.physics.atanh_eps)
+                with torch.no_grad():
+                    log_ratio = log_prob_seq - old_log_probs_batch
+                    kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
                 
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] action_batch (clamped): min={a.min():.6f}, max={a.max():.6f}, has_nan={torch.isnan(a).any()}")
-                
-                u = 0.5 * (torch.log1p(a) - torch.log1p(-a))
-                
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] u (inverse_tanh): min={u.min():.6f}, max={u.max():.6f}, has_nan={torch.isnan(u).any()}")
-                
-                # First compute the Gaussian log prob
-                action_diff = u - mu  # (T, 12)
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] (u - mu): min={action_diff.min():.6f}, max={action_diff.max():.6f}, has_nan={torch.isnan(action_diff).any()}")
-                
-                gaussian_term = -0.5 * ((action_diff) ** 2 / (std ** 2)).sum(dim=1)  # (T,)
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] gaussian_term: min={gaussian_term.min():.6f}, max={gaussian_term.max():.6f}, has_nan={torch.isnan(gaussian_term).any()}")
-                
-                log_prob_gaussian = gaussian_term - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] log_prob_gaussian: min={log_prob_gaussian.min():.6f}, max={log_prob_gaussian.max():.6f}, has_nan={torch.isnan(log_prob_gaussian).any()}")
-                
-                # Now tanh correction  
-                action_sq_term = 1.0 - action_batch ** 2
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] (1 - action^2): min={action_sq_term.min():.6f}, max={action_sq_term.max():.6f}, has_nan={torch.isnan(action_sq_term).any()}")
-                
-                tanh_correction = -torch.log(action_sq_term + self.physics.log_eps).sum(dim=1)
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] tanh_correction: min={tanh_correction.min():.6f}, max={tanh_correction.max():.6f}, has_nan={torch.isnan(tanh_correction).any()}")
-                
-                log_prob_seq = log_prob_gaussian + tanh_correction
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] log_prob_seq (final): min={log_prob_seq.min():.6f}, max={log_prob_seq.max():.6f}, has_nan={torch.isnan(log_prob_seq).any()}")
-                    logger.info(f"[EPOCH {epoch}] old_log_probs_batch: min={old_log_probs_batch.min():.6f}, max={old_log_probs_batch.max():.6f}, has_nan={torch.isnan(old_log_probs_batch).any()}")
-                
-                log_prob_diff = log_prob_seq - old_log_probs_batch
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] log_prob_diff: min={log_prob_diff.min():.6f}, max={log_prob_diff.max():.6f}, has_nan={torch.isnan(log_prob_diff).any()}")
-                
-                ratio = torch.exp(log_prob_diff)
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] ratio: min={ratio.min():.6f}, max={ratio.max():.6f}, has_nan={torch.isnan(ratio).any()}, has_inf={torch.isinf(ratio).any()}")
-                
+                ratio = torch.exp(log_ratio)
                 clipped_ratio = torch.clamp(ratio, 1.0 - Config.PPO_CLIP_RATIO, 1.0 + Config.PPO_CLIP_RATIO)
-                
-                if epoch == 0:
-                    logger.info(f"[EPOCH {epoch}] advantages_batch: min={advantages_batch.min():.6f}, max={advantages_batch.max():.6f}, has_nan={torch.isnan(advantages_batch).any()}")
-                    logger.info(f"[EPOCH {epoch}] ratio * advantages: min={(ratio * advantages_batch).min():.6f}, max={(ratio * advantages_batch).max():.6f}, has_nan={torch.isnan(ratio * advantages_batch).any()}")
-                    logger.info(f"[EPOCH {epoch}] clipped_ratio * advantages: min={(clipped_ratio * advantages_batch).min():.6f}, max={(clipped_ratio * advantages_batch).max():.6f}, has_nan={torch.isnan(clipped_ratio * advantages_batch).any()}")
-                
                 policy_loss = -torch.min(ratio * advantages_batch, clipped_ratio * advantages_batch).mean()
+                
+                clip_frac = (torch.abs(ratio - 1.0) > Config.PPO_CLIP_RATIO).float().mean()
                 
                 v_pred = value_seq.squeeze()
                 v_old = values_batch.squeeze().detach()
@@ -1043,15 +1028,30 @@ class TrainingEngine:
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
         
+        # Diagnostics
+        with torch.no_grad():
+            joint_vels_batch = torch.cat(all_joint_vels)
+            sat_rate = (torch.abs(joint_vels_batch) >= 10.0).float().mean()
+            
+            contacts_batch = torch.cat(all_foot_contacts)
+            mean_contacts = contacts_batch.mean(dim=0)
+            all_4_freq = (contacts_batch.sum(dim=1) == 4.0).float().mean()
+            
+            action_clamps_batch = torch.cat(all_action_clamps)
+            clamp_frac = action_clamps_batch.mean().item()
+            
+            action_mean_per_joint = action_batch.mean(dim=0)
+            action_std_per_joint = action_batch.std(dim=0)
+        
         # Calculate average reward across all trajectories
         batch_reward = sum(sum(float(t['reward']) for t in traj_data['trajectory']) for traj_data in trajectories_wrapped) / len(trajectories_wrapped)
         self.episode_rewards.append(batch_reward)
         
         # Log debugging info
-        msg = f"Batch Ep {self.episode_count}: avg_reward={batch_reward:.2f}"
-        if not torch.isnan(policy_loss) and not torch.isnan(value_loss):
-            msg += f", policy_loss={total_policy_loss/Config.PPO_EPOCHS:.4f}, value_loss={total_value_loss/Config.PPO_EPOCHS:.4f}"
+        msg = f"Batch Ep {self.episode_count}: avg_reward={batch_reward:.2f}, policy_loss={total_policy_loss/Config.PPO_EPOCHS:.4f}, value_loss={total_value_loss/Config.PPO_EPOCHS:.4f}, entropy={entropy.item():.4f}, KL={kl.item():.4f}, clip={clip_frac.item():.4f}, action_clamp={clamp_frac:.2%}"
         logger.info(msg)
+        logger.info(f"  Actions: mean={action_mean_per_joint.mean().item():.3f}, std={action_std_per_joint.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}")
+        logger.info(f"  Contacts: {mean_contacts.tolist()} | All4 Freq: {all_4_freq.item():.2%}")
         print(msg)
     
     def train_world_model(self, trajectory):

@@ -158,10 +158,10 @@ velocity = clamp(velocity, -10 rad/s, +10 rad/s)
 Each joint receives a target torque:
 
 ```python
-# Raw action from policy: (1, 12) tanh output in [-1, 1]
-motor_torques = action * 5.0  # Scaled to [-5, 5] N⋅m
+# Raw action from policy: (1, 12) Gaussian output in R^12
+motor_torques = action # (12,) torques in R
 
-# Clamped for stability
+# Clamped for stability by the physics engine
 motor_torques = clamp(motor_torques, -max_torque, +max_torque)
 ```
 
@@ -198,17 +198,16 @@ def compute_balance_reward(creature, com_pos, stability_metrics, motor_torques, 
 
 ## Observation Space (`Environment.observe`)
 
-**37D observation in agent-centered coordinates**
+**34D observation in agent-centered coordinates**
 
 ```
 12D: Joint angles (θ₁₋₁₂)
 12D: Joint velocities (ω₁₋₁₂)
  4D: Foot contact states (c₁₋₄) ∈ [0, 1]
  3D: Body orientation (pitch, yaw, roll)
- 3D: COM position (always ~0 in agent-centered frame)
  3D: Goal position relative to COM
 -----
-37D: Total observation
+34D: Total observation
 ```
 
 ### Agent-Centered Observation
@@ -222,10 +221,9 @@ def observe(creature):
         creature.joint_velocities,                      # (12,)
         creature.foot_contact,                          # (4,)
         creature.orientation,                           # (3,)
-        zeros(3),  # COM is at origin in local frame   # (3,)
         goal_pos_global - creature.pos_global           # (3,) relative goal
     ])
-    return obs.unsqueeze(0)  # (1, 37)
+    return obs.unsqueeze(0)  # (1, 34)
 ```
 
 **Why agent-centered?**
@@ -250,7 +248,7 @@ contact_state = 1.0 if foot_z <= ground_level else 0.0
 ```python
 class EntityBelief(nn.Module):
     def __init__(
-        obs_dim=37,          # 37D quadruped observation
+        obs_dim=34,          # 34D quadruped observation
         num_actions=12,      # 12D motor torques (default, changed from 3)
         ...
     ):
@@ -265,10 +263,8 @@ Log probability calculation updated for 12D space:
 
 ```python
 # In collect_trajectory:
-log_prob_gaussian = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
-log_prob_gaussian -= log_std.sum(dim=1) - 0.5 * 12 * LOG_2PI  # 12 dimensions
-tanh_correction = -torch.log(1.0 - action_batch ** 2).sum(dim=1)  # 12D sum
-log_prob = log_prob_gaussian + tanh_correction
+log_prob = -0.5 * ((u - mu) ** 2 / (std ** 2)).sum(dim=1)
+log_prob -= log_std.sum(dim=1) + 0.5 * 12 * LOG_2PI  # 12 dimensions
 ```
 
 ## Configuration Updates (`config.py`)
@@ -277,12 +273,12 @@ Key changes:
 
 ```python
 # Observation/Action dimensions
-OBS_DIM = 37  # From 7
-ACTION_DIM = 12  # From 3
+OBS_DIM = 34  # From 37
+ACTION_DIM = 12
 
 # Memory model updated
-OBS_BYTES = 148  # (1, 37) float32
-PER_STEP_BYTES = 300  # Larger action space
+OBS_BYTES = 136  # (1, 34) float32
+PER_STEP_BYTES = 280
 
 # Balance task rewards (replaces navigation rewards)
 COM_DISTANCE_THRESHOLD = 0.3
@@ -345,7 +341,7 @@ done = com_distance < com_distance_threshold  # 0.3m
 - [ ] Forward kinematics produces valid foot positions
 - [ ] COM calculation is physically reasonable
 - [ ] Motor torques correctly update joint states
-- [ ] Observation tensor has correct shape (1, 37)
+- [ ] Observation tensor has correct shape (1, 34)
 - [ ] Policy outputs correct action shape (1, 12)
 - [ ] Reward is computed from COM position, not goal distance
 - [ ] Training loop converges (agent learns to balance)

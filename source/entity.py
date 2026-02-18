@@ -195,106 +195,38 @@ class Encoder(nn.Module):
         return self.net(x)  # (N, embed_dim)
 
 
-class SimpleGATLayer(nn.Module):
-    """
-    Multi-head graph attention (GAT) layer without torch_geometric.
-    edge_index: (2, E) with source -> target edges.
-    """
-    def __init__(self, in_dim: int, out_dim: int, heads: int = 4, concat: bool = True, dropout: float = 0.0):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.heads = heads
-        self.concat = concat
-        self.dropout = dropout
-        self.heads_out_dim = heads * out_dim
-
-        # Linear projection per head: (in_dim) -> (heads*out_dim)
-        self.W = nn.Linear(in_dim, self.heads_out_dim, bias=False)
-
-        # Attention vectors per head: a^T [Wh_i || Wh_j]
-        self.a_src = nn.Parameter(torch.empty(heads, out_dim))
-        self.a_dst = nn.Parameter(torch.empty(heads, out_dim))
-
-        nn.init.xavier_uniform_(self.W.weight)
-        nn.init.xavier_uniform_(self.a_src)
-        nn.init.xavier_uniform_(self.a_dst)
-
-        self.leaky_relu = nn.LeakyReLU(0.2)
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
-        """
-        x: (N, in_dim)
-        edge_index: (2, E) with edge_index[0]=src, edge_index[1]=dst
-        returns:
-          (N, heads*out_dim) if concat else (N, out_dim)
-        """
-        N = x.size(0)
-        
-        # ✅ OPTIMIZATION: For single node, attention is identity
-        # This is a huge speedup in single-agent training
-        if N == 1:
-            h = self.W(x)  # (1, heads*out_dim)
-            return h if self.concat else h.view(1, self.heads, self.out_dim).mean(dim=1)
-        
-        src, dst = edge_index[0], edge_index[1]  # (E,), (E,)
-        device = x.device
-        dtype = x.dtype  # ✅ Match input dtype
-
-        # Project node features
-        h = self.W(x).view(N, self.heads, self.out_dim)  # (N, H, D)
-
-        # Compute unnormalized attention scores e_ij per edge and head
-        # e_ij = LeakyReLU( a_src·h_i + a_dst·h_j )
-        e = (h[src] * self.a_src).sum(-1) + (h[dst] * self.a_dst).sum(-1)  # (E, H)
-        e = self.leaky_relu(e)
-
-        # Softmax over incoming edges per dst node, separately per head
-        # ✅ FIX: Match dtype for numerical stability in mixed precision
-        alpha = torch.zeros((src.size(0), self.heads), device=device, dtype=dtype)
-        for head in range(self.heads):
-            e_h = e[:, head]
-            # Use proper negative infinity for dtype
-            max_per_dst = torch.full((N,), torch.finfo(dtype).min, device=device, dtype=dtype)
-            max_per_dst.scatter_reduce_(0, dst, e_h, reduce="amax", include_self=True)
-            exp = torch.exp(e_h - max_per_dst[dst])
-            denom = torch.zeros((N,), device=device, dtype=dtype)
-            denom.scatter_add_(0, dst, exp)
-            alpha[:, head] = exp / (denom[dst] + 1e-9)
-
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-
-        # Message passing: sum_j alpha_ij * h_j into dst i
-        out = torch.zeros((N, self.heads, self.out_dim), device=device, dtype=dtype)
-        for head in range(self.heads):
-            msg = h[src, head, :] * alpha[:, head].unsqueeze(-1)
-            out[:, head, :].scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
-
-        if self.concat:
-            return out.reshape(N, self.heads_out_dim)
-        else:
-            return out.mean(dim=1)
-
-
 class EntityBelief(nn.Module):
-    """GAT at each timestep, then per-entity LSTM across time.
-    Outputs 12D motor torques for quadruped legs."""
+    """
+    Feature encoder + projection + LSTM for quadruped motor control.
+    
+    Architecture:
+      1) Encoder: 2-layer MLP (34D obs → 128D features)
+      2) Feature projection: Linear(128 → 256D) for LSTM input
+      3) LSTM: Per-entity temporal memory (unidirectional, causal for RL)
+      4) Policy+Value heads: Output 12D motor torques and scalar value estimate
+    
+    Note: Currently a simple linear projection for baseline training.
+    Future (Option B): Replace with 12-node joint graph attention if needed.
+    
+    Outputs 12D motor torques for quadruped legs.
+    """
     def __init__(
         self,
         obs_dim: int,
         embed_dim: int,
-        gat_out_dim: int,
-        gat_heads: int,
+        gat_out_dim: int,  # Unused, kept for config compatibility
+        gat_heads: int,    # Unused, kept for config compatibility
         lstm_hidden: int,
         num_actions: int = 12,  # 12 joint torques for quadruped
     ):
         super().__init__()
 
         self.encoder = Encoder(obs_dim, embed_dim)
-        self.gat = SimpleGATLayer(embed_dim, gat_out_dim, heads=gat_heads, concat=True, dropout=0.1)
+        # Simple linear projection: 128D encoder output → 256D LSTM input
+        # (Future: replace with 12-node GAT if joint-structure learning needed)
+        self.feature_projection = nn.Linear(embed_dim, lstm_hidden)
 
-        self.gat_feat_dim = gat_out_dim * gat_heads
-        self.lstm = nn.LSTMCell(self.gat_feat_dim, lstm_hidden)
+        self.lstm = nn.LSTMCell(lstm_hidden, lstm_hidden)
 
         # Policy head: outputs mean and std for 12D motor torques
         self.policy_mu = nn.Linear(lstm_hidden, num_actions)
@@ -316,17 +248,17 @@ class EntityBelief(nn.Module):
     def forward(
         self,
         obs_t: torch.Tensor,                       # (N, obs_dim)
-        edge_index_t: torch.Tensor,                # (2, E)
+        edge_index_t: torch.Tensor = None,         # Unused (kept for compatibility)
         prev_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (h, c) each (N, H)
     ):
         N = obs_t.size(0)
         device, dtype = obs_t.device, obs_t.dtype
 
-        # 1) encode per entity
-        e_t = self.encoder(obs_t)                  # (N, embed_dim)
+        # 1) encode observations
+        e_t = self.encoder(obs_t)                  # (N, 128)
 
-        # 2) relational mixing at same timestep
-        g_t = self.gat(e_t, edge_index_t)          # (N, gat_heads*gat_out_dim)
+        # 2) project to LSTM input dimension
+        g_t = self.feature_projection(e_t)         # (N, 256)
 
         # 3) temporal memory per entity
         if prev_state is None:
@@ -352,7 +284,19 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
 
     Returns:
       creature: Creature dataclass with all leg/joint states
-      edge_index: (2, 1) self-loop graph for GAT
+      edge_index: (2, E) graph edges
+      
+    Graph Structure:
+      CURRENT (Optimized for vectorized training):
+        - Single node (0) with self-loop
+        - Edge: (0 -> 0), so edge_index = [[0], [0]]
+        - Effectively just a linear projection (attention simplifies to identity for N=1)
+      
+      FUTURE (could implement for explicit joint modeling):
+        - 12 nodes: one per joint (3 per leg × 4 legs)
+        - Edges: kinematic chain (hip→knee→ankle per leg) + optional hip coordination
+        - Node features: joint angles, velocities, previous actions
+        - Would enable explicit learning of joint dependencies
     """
     if device is None:
         device = next(model.parameters()).device
@@ -399,7 +343,9 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
         foot_contact=foot_contact,
     )
 
-    # Self-loop edge for a single node graph
+    # Graph structure: Currently a single-node self-loop (efficiency optimization)
+    # For multi-node graph, would have 12 nodes with kinematic chain + hip coupling edges
+    # See init_single_creature docstring for full 14-edge graph specification
     edge_index = torch.tensor([[0], [0]], dtype=torch.long, device=device)
 
     return creature, edge_index

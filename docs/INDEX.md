@@ -8,7 +8,9 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 - **[QUICKSTART.md](QUICKSTART.md)** - Get up and running in 5 minutes
 - **[CONFIGURATION.md](CONFIGURATION.md)** - All configuration parameters explained
 
-### Quadruped Balance Task
+### Latest Updates (February 2026)
+- **[PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md)** - ⭐ NEW: 250 Hz, restitution, friction cones, vectorization
+- **[ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md)** - How we compare to NVIDIA Isaac Gym standard
 - **[QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md)** - Quadruped architecture, 12 DOF forward kinematics, balance-focused rewards
 - **[PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md)** - Improved physics (gravity integration, spring-damper contacts, velocity clamping, agent-centered world)
 
@@ -16,8 +18,17 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 - **[AGENT_SYSTEM.md](AGENT_SYSTEM.md)** - Agent neural networks, policy/value heads, motor control
 - **[WORLD_SYSTEM.md](WORLD_SYSTEM.md)** - Physics engine, reward function, environment mechanics
 
-### Physics & Dynamics
-- **[PHYSICS_ENGINE_IMPROVED.md](PHYSICS_ENGINE_IMPROVED.md)** - Advanced rigid body dynamics, quaternions, constraint solvers, contact modeling
+### Physics & Dynamics Runtime
+- **[PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md)** - **START HERE** - 3 presets, copy-paste configs
+- **[PHYSICS_FUNDAMENTALS.md](PHYSICS_FUNDAMENTALS.md)** - Core concepts, architecture, observation/action spaces
+- **[ACTUATOR_LAG.md](ACTUATOR_LAG.md)** - Motor response time tuning (Phase 1)
+- **[FRICTION_MODELS.md](FRICTION_MODELS.md)** - Stick-slip friction comparison (Phase 2)  
+- **[ENERGY_TRACKING.md](ENERGY_TRACKING.md)** - Power consumption monitoring (Phase 4)
+- **[PHYSICS_DELIVERY_SUMMARY.md](PHYSICS_DELIVERY_SUMMARY.md)** - What's included, learning paths, FAQ
+
+### Physics Theory & Design
+- **[PHYSICS_ENGINE_DESIGN.md](PHYSICS_ENGINE_DESIGN.md)** - Design philosophy, roadmap (Phases 1-6)
+- **[DRL_PHYSICS_PLUGIN.md](DRL_PHYSICS_PLUGIN.md)** - How DRL integrates with physics engine
 
 ### Architecture & Deep Dives
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - System design, 5-class modular architecture, data flow
@@ -26,24 +37,17 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 
 ## 🎯 Quick Links by Use Case
 
-### "I want to train the quadruped to balance"
-→ [QUICKSTART.md](QUICKSTART.md) → [QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md) → [CONFIGURATION.md](CONFIGURATION.md)
+### "I want to start training NOW"
+→ [PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md) (2 min, copy preset, done!)
 
-### "I want to understand the physics engine"
-→ [PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md) → Sections: Gravity Integration, Contact Forces, Joint Dynamics
+### "I want to understand the physics system"
+→ [PHYSICS_FUNDAMENTALS.md](PHYSICS_FUNDAMENTALS.md) (overview) → [PHYSICS_ENGINE_DESIGN.md](PHYSICS_ENGINE_DESIGN.md) (architecture)
 
-### "I want to understand agent-centered world coordinates"
-→ [PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md) → Section: "Agent-Centered World Coordinates"
+### "I want to tune for a specific use case"
+→ [PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md) (presets) → [ACTUATOR_LAG.md](ACTUATOR_LAG.md) / [FRICTION_MODELS.md](FRICTION_MODELS.md) / [ENERGY_TRACKING.md](ENERGY_TRACKING.md)
 
-### "I want to understand the agent's neural network"
-→ [AGENT_SYSTEM.md](AGENT_SYSTEM.md) → Sections: Architecture, Policy Head, Value Head
-
-### "I want to understand reward design"
-→ [QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md) → Section: "Reward Function"
-→ [PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md) → Section: "Reward Function Breakdown"
-
-### "I want to add new features or modify the system"
-→ [ARCHITECTURE.md](ARCHITECTURE.md) → [CONFIGURATION.md](CONFIGURATION.md)
+### "What exactly was delivered?"
+→ [PHYSICS_DELIVERY_SUMMARY.md](PHYSICS_DELIVERY_SUMMARY.md) (complete inventory)
 
 ## 📋 File Map
 

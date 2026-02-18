@@ -2,6 +2,15 @@
 
 Complete documentation of all configuration options. Default values are tuned and work well.
 
+## GPU Acceleration (Feb 2026)
+
+**Automatic CUDA Support**: Joint dynamics now GPU-accelerated using Numba CUDA.
+- If NVIDIA GPU available: Uses parallel kernel (12 joints processed in parallel)
+- If no CUDA or error: Automatic fallback to CPU PyTorch (no code changes needed)
+- **Estimated speedup**: 2-3x faster joint updates
+
+No configuration needed - auto-detection handles everything.
+
 ## Quick Start
 
 For most users: **Use defaults**, adjust only these:
@@ -20,7 +29,7 @@ MAX_TRAINING_EPISODES = 100
 MAX_STEPS_PER_EPISODE = 1000
 # Steps per episode
 # Range: 500-2000
-# Note: Reduced from 2000 for faster collection cycles
+# With GPU physics: faster collection, can use longer episodes
 
 LOAD_CHECKPOINT = True
 # Resume training from checkpoint
