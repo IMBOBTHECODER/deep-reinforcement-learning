@@ -181,7 +181,12 @@ class Creature:
 
 
 class Encoder(nn.Module):
-    """Per-entity feature encoder. Swap with CNN if obs are images."""
+    """PATTERN A: Shared encoder trained ONLY by Dreamer on replay buffer.
+    
+    - Prevents representation drift from mixed on/off-policy objectives
+    - PPO uses frozen (or EMA-synced) output from this encoder
+    - Swap with CNN if obs are images.
+    """
     def __init__(self, obs_dim: int, embed_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -189,24 +194,59 @@ class Encoder(nn.Module):
             nn.ReLU(),
             nn.Linear(256, embed_dim),
         )
+        self.embed_dim = embed_dim
+        self.obs_dim = obs_dim
 
     def forward(self, x):
         # x: (N, obs_dim)
         return self.net(x)  # (N, embed_dim)
 
 
-class EntityBelief(nn.Module):
-    """
-    Feature encoder + projection + LSTM for quadruped motor control.
+class PPOPolicy(nn.Module):
+    """PATTERN A: Policy controller using frozen Dreamer encoder.
     
     Architecture:
-      1) Encoder: 2-layer MLP (34D obs → 128D features)
-      2) Feature projection: Linear(128 → 256D) for LSTM input
+      1) Input: latent features from Dreamer encoder (frozen)
+      2) Projection: Linear(latent_dim → lstm_hidden)
       3) LSTM: Per-entity temporal memory (unidirectional, causal for RL)
       4) Policy+Value heads: Output 12D motor torques and scalar value estimate
     
-    Note: Currently a simple linear projection for baseline training.
-    Future (Option B): Replace with 12-node joint graph attention if needed.
+    Key: Encoder is frozen or updated via slow EMA from Dreamer training.
+    This prevents representation drift from mixed on/off-policy objectives.
+    """
+    def __init__(
+        self,
+        latent_dim: int,        # Input dimension (from frozen encoder)
+        lstm_hidden: int,
+        num_actions: int = 12,
+    ):
+        super().__init__()
+
+        # Input: latent features from shared encoder (NOT training this encoder)
+        self.feature_projection = nn.Linear(latent_dim, lstm_hidden)
+
+        self.lstm = nn.LSTMCell(lstm_hidden, lstm_hidden)
+
+        # Policy head: outputs mean and std for 12D motor torques
+        self.policy_mu = nn.Linear(lstm_hidden, num_actions)
+
+        # ✅ STABILITY: log_std is a global learned parameter (not state-dependent)
+        self.log_std_param = nn.Parameter(torch.zeros(num_actions))
+
+        self.value = nn.Linear(lstm_hidden, 1)
+
+
+class EntityBelief(nn.Module):
+    """PATTERN A wrapper: Shared encoder + PPOPolicy
+    
+    Architecture:
+      1) Encoder (SHARED): 34D obs → 128D features (trained ONLY by Dreamer on replay)
+      2) PPOPolicy: LSTM + Policy/Value heads (uses frozen encoder output)
+    
+    This prevents representation drift from mixed on/off-policy training objectives.
+    - Dreamer trains encoder offline on replay buffer
+    - PPO uses frozen (or EMA-synced) encoder output
+    - Only PPOPolicy is updated during PPO training
     
     Outputs 12D motor torques for quadruped legs.
     """
@@ -221,25 +261,23 @@ class EntityBelief(nn.Module):
     ):
         super().__init__()
 
+        # SHARED: encoder trained only by Dreamer on replay buffer
         self.encoder = Encoder(obs_dim, embed_dim)
-        # Simple linear projection: 128D encoder output → 256D LSTM input
-        # (Future: replace with 12-node GAT if joint-structure learning needed)
-        self.feature_projection = nn.Linear(embed_dim, lstm_hidden)
-
-        self.lstm = nn.LSTMCell(lstm_hidden, lstm_hidden)
-
-        # Policy head: outputs mean and std for 12D motor torques
-        self.policy_mu = nn.Linear(lstm_hidden, num_actions)
-
-        # ✅ STABILITY: log_std is a global learned parameter (not state-dependent)
-        # This is the PPO baseline choice: prevents variance from exploding or collapsing
-        self.log_std_param = nn.Parameter(torch.zeros(num_actions))
-
-        self.value = nn.Linear(lstm_hidden, 1)
+        
+        # PPO policy uses frozen encoder output
+        self.policy = PPOPolicy(
+            latent_dim=embed_dim,
+            lstm_hidden=lstm_hidden,
+            num_actions=num_actions
+        )
+        
+        # Freeze encoder for PPO (only Dreamer will train it)
+        for param in self.encoder.parameters():
+            param.requires_grad = False
 
     def init_state(self, N: int, device, dtype):
         """Initialize LSTM state for N entities."""
-        H = self.lstm.hidden_size
+        H = self.policy.lstm.hidden_size
         return (
             torch.zeros((N, H), device=device, dtype=dtype),
             torch.zeros((N, H), device=device, dtype=dtype),
@@ -254,26 +292,27 @@ class EntityBelief(nn.Module):
         N = obs_t.size(0)
         device, dtype = obs_t.device, obs_t.dtype
 
-        # 1) encode observations
-        e_t = self.encoder(obs_t)                  # (N, 128)
+        # 1) encode observations (FROZEN - trained only by Dreamer)
+        with torch.no_grad():
+            e_t = self.encoder(obs_t)              # (N, 128)
 
-        # 2) project to LSTM input dimension
-        g_t = self.feature_projection(e_t)         # (N, 256)
+        # 2) project latent features to LSTM input dimension
+        g_t = self.policy.feature_projection(e_t)  # (N, lstm_hidden)
 
         # 3) temporal memory per entity
         if prev_state is None:
             prev_state = self.init_state(N, device, dtype)
 
-        h_t, c_t = self.lstm(g_t, prev_state)      # (N, hidden)
+        h_t, c_t = self.policy.lstm(g_t, prev_state)  # (N, hidden)
 
         # 4) policy and value heads
-        mu = self.policy_mu(h_t)                   # (N, A)
+        mu = self.policy.policy_mu(h_t)            # (N, A)
         
         # ✅ Global log_std (stable, not state-dependent)
-        log_std = self.log_std_param.expand_as(mu)  # (N, A)
-        log_std = torch.clamp(log_std, -5, 2)       # PPO-safe range: std in [0.0067, 7.4]
+        log_std = self.policy.log_std_param.expand_as(mu)  # (N, A)
+        log_std = torch.clamp(log_std, -5, 2)      # PPO-safe range: std in [0.0067, 7.4]
         
-        v = self.value(h_t).squeeze(-1)            # (N,)
+        v = self.policy.value(h_t).squeeze(-1)     # (N,)
 
         return (mu, log_std), v, (h_t, c_t)
 
@@ -352,25 +391,28 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
 
 
 class WorldModel(nn.Module):
+    """DreamerV3-inspired world model for learning environment representation.
+    
+    PATTERN A ARCHITECTURE:
+    - Uses SHARED encoder (same as PPO policy)
+    - Encoder is trainable ONLY here, frozen elsewhere
+    - Learns latent dynamics, reward prediction, termination on REPLAY BUFFER
+    - Off-policy learning prevents drift from mixed on/off-policy objectives
+    
+    Trained on rollout buffer (old experiences), not on-policy sampled data.
     """
-    DreamerV3-inspired world model for imagining future trajectories.
-    Learns latent state transitions and reward prediction.
-    """
-    def __init__(self, obs_dim: int, action_dim: int, latent_dim: int = 128, hidden_dim: int = 256):
+    def __init__(self, obs_dim: int, action_dim: int, latent_dim: int = 128, hidden_dim: int = 256, encoder: Encoder = None):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         
-        # Encoder: obs -> latent state
-        self.encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim)
-        )
+        # Use SHARED encoder if provided, otherwise create one
+        if encoder is not None:
+            self.encoder = encoder  # Will be shared with PPOPolicy
+        else:
+            self.encoder = Encoder(obs_dim, latent_dim)
         
         # Dynamics model: (latent_state, action) -> next_latent_state
         self.dynamics = nn.Sequential(
@@ -405,7 +447,7 @@ class WorldModel(nn.Module):
         )
     
     def encode(self, obs):
-        """Encode observation to latent state."""
+        """Encode observation to latent state (trains shared encoder)."""
         return self.encoder(obs)
     
     def decode(self, latent):

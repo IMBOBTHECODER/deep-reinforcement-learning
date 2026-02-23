@@ -9,14 +9,14 @@ class Config:
     # Core training parameters
     DIM = (64, 32, 64)  # World dimensions (larger for balance task)
     MAX_STEPS_PER_EPISODE = 1024
-    MAX_TRAINING_EPISODES = 50
+    MAX_TRAINING_EPISODES = 128
     LOAD_CHECKPOINT = False
     CHECKPOINT_DIR = Path("checkpoint")
     
     # ============ VECTORIZED MULTI-ENVIRONMENT TRAINING ============
     # Always enabled: Multiple agents train in parallel for efficiency
     NUM_ENVS = None  # Auto-detect based on available memory
-    MAX_ENVS = 8
+    MAX_ENVS = 16
     MIN_ENVS = 2
     MAX_DATA_THRESHOLD_MB = 8192
     
@@ -140,15 +140,7 @@ class Config:
     
     # Balance control
     MAX_PITCH_ROLL = 0.5  # rad, max allowed tilt before penalty
-    
-    # Advanced physics (legacy, not used in new system)
-    MOMENTUM_DAMPING = 0.02
-    TERMINAL_VELOCITY_Z = -30.0
-    MAX_ACCELERATION = 2.0
-    ACTION_SCALE_Z = 0.2
-    MAX_VELOCITY = 10.0
-    AIR_FRICTION_COEFFICIENT = 0.03
-    AIR_DRAG_COEFFICIENT = 0.001
+    ACTION_SCALE_Z = 0.2  # Scale factor for Z-axis actions (reduce vertical thrashing)
     
     # ============ DREAMER V3 WORLD MODEL ============
     WORLD_MODEL_LATENT_DIM = 128

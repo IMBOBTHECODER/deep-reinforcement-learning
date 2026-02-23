@@ -4,81 +4,97 @@ Welcome! This folder contains comprehensive documentation for the agent-centered
 
 ## 📚 Documentation Structure
 
-### Getting Started
+### Getting Started (Quick Links)
 - **[QUICKSTART.md](QUICKSTART.md)** - Get up and running in 5 minutes
 - **[CONFIGURATION.md](CONFIGURATION.md)** - All configuration parameters explained
+- **[PHYSICS.md](PHYSICS.md)** - Comprehensive physics guide (13 sections, reference doc)
 
-### Latest Updates (February 2026)
-- **[PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md)** - ⭐ NEW: 250 Hz, restitution, friction cones, vectorization
-- **[JOINT_CONSTRAINTS.md](JOINT_CONSTRAINTS.md)** - ⭐ NEW: Realistic joint types (revolute, spherical, fixed, hinge2, prismatic)
-- **[JOINT_CONSTRAINTS_INTEGRATION.md](JOINT_CONSTRAINTS_INTEGRATION.md)** - ⭐ NEW: How to enable joint constraints in your simulation
-- **[JOINT_CONSTRAINTS_EXAMPLES.md](JOINT_CONSTRAINTS_EXAMPLES.md)** - ⭐ NEW: Copy-paste examples and troubleshooting
-- **[ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md)** - How we compare to NVIDIA Isaac Gym standard
-- **[QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md)** - Quadruped architecture, 12 DOF forward kinematics, balance-focused rewards
-- **[PHYSICS_AND_WORLD.md](PHYSICS_AND_WORLD.md)** - Improved physics (gravity integration, spring-damper contacts, velocity clamping, agent-centered world)
+### Latest Feature Updates (February 2026)
+- **[PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md)** - 250 Hz, restitution, friction cones, vectorization
+- **[JOINT_CONSTRAINTS.md](JOINT_CONSTRAINTS.md)** - Realistic joint types (revolute, spherical, fixed, hinge2, prismatic) with integrated examples
+- **[ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md)** - Comparison to NVIDIA Isaac Gym standard
+- **[ISAACLAB_COMPARABILITY.md](ISAACLAB_COMPARABILITY.md)** - IsaacLab v1.0 compatibility analysis
 
-### Core Systems & Agent Design
+### Core Systems & Architecture
+- **[QUADRUPED_BALANCE_TASK.md](QUADRUPED_BALANCE_TASK.md)** - Quadruped design, 12 DOF forward kinematics, balance-focused rewards
 - **[AGENT_SYSTEM.md](AGENT_SYSTEM.md)** - Agent neural networks, policy/value heads, motor control
-- **[WORLD_SYSTEM.md](WORLD_SYSTEM.md)** - Physics engine, reward function, environment mechanics
-
-### Physics & Dynamics Runtime
-- **[PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md)** - **START HERE** - 3 presets, copy-paste configs
-- **[PHYSICS_FUNDAMENTALS.md](PHYSICS_FUNDAMENTALS.md)** - Core concepts, architecture, observation/action spaces
-- **[ACTUATOR_LAG.md](ACTUATOR_LAG.md)** - Motor response time tuning (Phase 1)
-- **[FRICTION_MODELS.md](FRICTION_MODELS.md)** - Stick-slip friction comparison (Phase 2)  
-- **[ENERGY_TRACKING.md](ENERGY_TRACKING.md)** - Power consumption monitoring (Phase 4)
-- **[PHYSICS_DELIVERY_SUMMARY.md](PHYSICS_DELIVERY_SUMMARY.md)** - What's included, learning paths, FAQ
-
-### Physics Theory & Design
-- **[PHYSICS_ENGINE_DESIGN.md](PHYSICS_ENGINE_DESIGN.md)** - Design philosophy, roadmap (Phases 1-6)
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - System design, 5-class modular architecture, data flow
 - **[DRL_PHYSICS_PLUGIN.md](DRL_PHYSICS_PLUGIN.md)** - How DRL integrates with physics engine
 
-### Architecture & Deep Dives
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - System design, 5-class modular architecture, data flow
-- **[WORLD_MODEL.md](WORLD_MODEL.md)** - DreamerV3 world model training
-- **[PERFORMANCE.md](PERFORMANCE.md)** - Optimization, kernel fusion, profiling
+### Physics Subsystems (Specialized Topics)
+- **[PHYSICS_CONFIG_GUIDE.md](PHYSICS_CONFIG_GUIDE.md)** - Physics parameter tuning guide
+- **[ACTUATOR_LAG.md](ACTUATOR_LAG.md)** - Motor response time, lag dynamics
+- **[FRICTION_MODELS.md](FRICTION_MODELS.md)** - Friction models and comparison
+- **[ENERGY_TRACKING.md](ENERGY_TRACKING.md)** - Power consumption monitoring
+
+### Training & AI
+- **[WORLD_MODEL.md](WORLD_MODEL.md)** - DreamerV3 world model learning
+- **[EVALUATION.md](EVALUATION.md)** - Evaluation metrics and procedures
+
+### Performance & Design
+- **[PERFORMANCE.md](PERFORMANCE.md)** - Optimization, profiling, benchmarks
 
 ## 🎯 Quick Links by Use Case
 
 ### "I want to start training NOW"
-→ [PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md) (2 min, copy preset, done!)
+→ [QUICKSTART.md](QUICKSTART.md) (2 min)
 
 ### "I want realistic joint constraints"
-→ [JOINT_CONSTRAINTS_EXAMPLES.md](JOINT_CONSTRAINTS_EXAMPLES.md) (5 min, 4 lines of code!)
+→ [JOINT_CONSTRAINTS.md](JOINT_CONSTRAINTS.md) - See "Examples & Usage" section (5 min, 4 lines of code!)
 
 ### "I want to understand the physics system"
-→ [PHYSICS_FUNDAMENTALS.md](PHYSICS_FUNDAMENTALS.md) (overview) → [PHYSICS_ENGINE_DESIGN.md](PHYSICS_ENGINE_DESIGN.md) (architecture)
+→ [PHYSICS.md](PHYSICS.md) (comprehensive 13-part guide)
 
-### "I want to tune for a specific use case"
-→ [PHYSICS_QUICK_START.md](PHYSICS_QUICK_START.md) (presets) → [ACTUATOR_LAG.md](ACTUATOR_LAG.md) / [FRICTION_MODELS.md](FRICTION_MODELS.md) / [ENERGY_TRACKING.md](ENERGY_TRACKING.md)
+### "I want to compare with industry standards"
+→ [ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md) (NVIDIA Isaac Gym)  
+→ [ISAACLAB_COMPARABILITY.md](ISAACLAB_COMPARABILITY.md) (NVIDIA IsaacLab)
 
-### "What exactly was delivered?"
-→ [PHYSICS_DELIVERY_SUMMARY.md](PHYSICS_DELIVERY_SUMMARY.md) (complete inventory)
+### "I want to tune physics for a specific use case"
+→ [PHYSICS_CONFIG_GUIDE.md](PHYSICS_CONFIG_GUIDE.md) (parameter tuning)  
+→ [ACTUATOR_LAG.md](ACTUATOR_LAG.md) (motor response)  
+→ [FRICTION_MODELS.md](FRICTION_MODELS.md) (ground friction)  
+→ [ENERGY_TRACKING.md](ENERGY_TRACKING.md) (power consumption)
 
 ## 📋 File Map
 
-| Document | Topics |
-|----------|--------|
-| QUICKSTART.md | Setup, run, first training results |
-| CONFIGURATION.md | All parameters, physics tuning, reward weights |
-| **QUADRUPED_BALANCE_TASK.md** | **Quadruped design, 4 legs × 3 joints, forward kinematics, balance task** |
-| **PHYSICS_AND_WORLD.md** | **Gravity integration, spring-damper contacts, joint velocity limits, agent-centered world** |
-| **JOINT_CONSTRAINTS.md** | **Joint types (revolute, spherical, fixed, hinge2, prismatic), physics parameters, tuning** |
-| **JOINT_CONSTRAINTS_INTEGRATION.md** | **How to enable constraints in PhysicsEngine, configuration patterns** |
-| **JOINT_CONSTRAINTS_EXAMPLES.md** | **Copy-paste code examples, before/after comparison, troubleshooting** |
-| AGENT_SYSTEM.md | Neural networks, motor control, policy/value heads |
-| WORLD_SYSTEM.md | Physics engine, reward computation, mechanics |
-| ARCHITECTURE.md | 5-class modular design (Environment, PhysicsEngine, Renderer, TrainingEngine, System) |
-| WORLD_MODEL.md | DreamerV3 world model, dynamics learning |
-| PERFORMANCE.md | Optimization, JIT kernel fusion, profiling |
+## 📋 File Map (19 Total Documents)
 
-**Total: ~4500 lines of comprehensive documentation**
+| Document | Focus | Use For |
+|----------|-------|---------|
+| **QUICKSTART.md** | Setup & first training | Getting started quickly |
+| **CONFIGURATION.md** | All parameters | Tuning specific values |
+| **PHYSICS.md** | Complete physics reference | Understanding system in depth |
+| **PHYSICS_CONFIG_GUIDE.md** | Parameter tuning | Optimizing physics behavior |
+| **PHYSICS_ENGINE_UPGRADES.md** | 250 Hz, restitution, friction cones | Understanding latest improvements |
+| **QUADRUPED_BALANCE_TASK.md** | Quadruped design, kinematics | Quadruped morphology details |
+| **JOINT_CONSTRAINTS.md** | Joint types, limits, examples | Realistic joint configuration |
+| **AGENT_SYSTEM.md** | Neural networks, control | Agent architecture |
+| **ARCHITECTURE.md** | 5-class modular design | System structure |
+| **WORLD_MODEL.md** | DreamerV3 world model | Training world models |
+| **DRL_PHYSICS_PLUGIN.md** | DRL physics integration | Agent-physics interaction |
+| **ISAAC_GYM_COMPARISON.md** | Isaac Gym comparison | Industry standard benchmarking |
+| **ISAACLAB_COMPARABILITY.md** | IsaacLab compatibility | Modern framework comparison |
+| **ACTUATOR_LAG.md** | Motor response time | Motor dynamics tuning |
+| **FRICTION_MODELS.md** | Friction models | Ground interaction physics |
+| **ENERGY_TRACKING.md** | Power consumption | Energy efficiency metrics |
+| **PERFORMANCE.md** | Optimization & benchmarks | Performance analysis |
+| **EVALUATION.md** | Evaluation metrics | Testing procedures |
+| **INDEX.md** | This file | Documentation navigation |
+
+## 🎯 Where to Start
+
+**Completely new?** → [QUICKSTART.md](QUICKSTART.md) (5 min)  
+**Want to understand physics?** → [PHYSICS.md](PHYSICS.md) (comprehensive, 13 sections)  
+**Need to configure something?** → [CONFIGURATION.md](CONFIGURATION.md)  
+**Want joint constraints?** → [JOINT_CONSTRAINTS.md](JOINT_CONSTRAINTS.md) (jump to "Examples & Usage")  
+**Comparing to industry standard?** → [ISAAC_GYM_COMPARISON.md](ISAAC_GYM_COMPARISON.md)
 
 ## 🔗 Related Resources
 
 - **Main README**: [../README.md](../README.md) - Project overview
-- **Source Code**: [../source/](../source/) - Implementation
-- **Config**: [../config.py](../config.py) - Configuration file
+- **Source Code**: [../source/](../source/) - Core implementation
+- **Config**: [../config.py](../config.py) - All parameters
+- **Training**: [../train.py](../train.py) - Start here to train the agent
 
 ## ⚙️ Technical Notes
 

@@ -386,21 +386,34 @@ class TrainingEngine:
         
         self.num_actions = NN_NUM_ACTIONS
         
-        # World model
+        # PATTERN A: Pass SHARED encoder to WorldModel
+        # WorldModel will train the encoder offline on replay buffer
+        # PPOPolicy uses frozen encoder output
         self.world_model = WorldModel(
             obs_dim=NN_OBS_DIM,
             action_dim=NN_NUM_ACTIONS,
-            latent_dim=Config.WORLD_MODEL_LATENT_DIM,
-            hidden_dim=Config.WORLD_MODEL_HIDDEN_DIM
+            latent_dim=Config.EMBED_DIM,
+            hidden_dim=Config.WORLD_MODEL_HIDDEN_DIM,
+            encoder=self.model.encoder  # SHARED
         ).to(device)
         
         # Optimizers
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=Config.LR)
+        # IMPORTANT: Compare by identity (id) not tensor equality
+        # Only encoder and world_model_params in world_model_optimizer
+        # PPO optimizer only updates policy parameters (not encoder)
+        encoder_params = list(self.model.encoder.parameters())
+        encoder_param_ids = {id(p) for p in encoder_params}
+        world_model_only_params = [p for p in self.world_model.parameters() if id(p) not in encoder_param_ids]
+        
         self.world_model_optimizer = torch.optim.Adam(
-            self.world_model.parameters(),
+            encoder_params + world_model_only_params,
             lr=Config.WORLD_MODEL_LR,
             weight_decay=Config.WORLD_MODEL_WEIGHT_DECAY
         )
+        
+        # PPO optimizer only touches policy parameters (frozen encoder)
+        ppo_params = [p for p in self.model.policy.parameters()]
+        self.optimizer = torch.optim.Adam(ppo_params, lr=Config.LR)
         
         # Training hyperparameters
         self.gamma = Config.GAMMA
@@ -422,6 +435,16 @@ class TrainingEngine:
         self.episode_count = 0
         self.episode_rewards = []
         self.frames_per_step = Config.TARGET_FPS // Config.EVAL_STEPS_PER_SEC
+    
+    def freeze_encoder(self):
+        """Freeze shared encoder for PPO training (Dreamer not active)."""
+        for param in self.model.encoder.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_encoder(self):
+        """Unfreeze shared encoder for Dreamer training on replay buffer."""
+        for param in self.model.encoder.parameters():
+            param.requires_grad = True
     
     def save_checkpoint(self):
         """Save model state to checkpoint file."""
@@ -497,14 +520,14 @@ class TrainingEngine:
             for env_id in range(num_envs):
                 if step_counts[env_id] < max_steps:
                     creature = self.env.creatures[env_id]
-                    obs = self.env.observe(creature)  # (1, 37)
+                    obs = self.env.observe(creature)  # (1, 34)
                     obs_list.append(obs)
             
             if not obs_list:
                 break  # All environments done
             
-            # Stack into batch: (batch_size, 37)
-            obs_batch = torch.cat(obs_list, dim=0)  # (num_active_envs, 37)
+            # Stack into batch: (batch_size, 34)
+            obs_batch = torch.cat(obs_list, dim=0)  # (num_active_envs, 34)
             
             # Get actions from model for all environments
             with torch.no_grad():
@@ -760,12 +783,23 @@ class TrainingEngine:
         return trajectory
     
     def train_on_trajectory(self, trajectory):
-        """Train on a collected trajectory using PPO for quadruped motor control."""
+        """Train on a collected trajectory using PPO for quadruped motor control.
+        
+        PATTERN A ARCHITECTURE:
+        1. Unfreeze and train Dreamer (encoder + world model) on replay buffer
+        2. Freeze encoder and train PPO policy on on-policy rollouts
+        This prevents representation drift from mixed objectives.
+        """
         if not trajectory:
             return
         
+        # ============ DREAMER TRAINING (off-policy on replay buffer) ============
+        self.unfreeze_encoder()  # Allow encoder to be updated
         wm_loss = self.train_world_model(trajectory)
-        logger.info(f"  World Model Loss: {wm_loss:.4f}")
+        logger.info(f"  [Dreamer] World Model Loss: {wm_loss:.4f}")
+        self.freeze_encoder()  # Re-freeze for PPO
+        
+        # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
         self.model.train()
         
@@ -870,6 +904,11 @@ class TrainingEngine:
     def train_on_trajectories_batch(self, trajectories_wrapped):
         """Train on multiple trajectories from vectorized environments.
         
+        PATTERN A ARCHITECTURE:
+        1. Unfreeze and train Dreamer (encoder + world model) on replay buffer
+        2. Freeze encoder and train PPO policy on on-policy rollouts
+        This prevents representation drift from mixed objectives.
+        
         Args:
             trajectories_wrapped: list of dicts with {'env_id', 'edge_index', 'trajectory'}
         """
@@ -888,12 +927,17 @@ class TrainingEngine:
             traj_reward = sum(float(step['reward']) for step in traj)
             logger.info(f"  Traj {i} (env_id={traj_data['env_id']}): len={len(traj)}, total_reward={traj_reward:.2f}")
         
+        # ============ DREAMER TRAINING (off-policy on replay buffer) ============
+        self.unfreeze_encoder()  # Allow encoder to be updated
         total_wm_loss = 0.0
         for traj_data in trajectories_wrapped:
             wm_loss = self.train_world_model(traj_data['trajectory'])
             total_wm_loss += wm_loss
         avg_wm_loss = total_wm_loss / len(trajectories_wrapped)
-        logger.info(f"  Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)")
+        logger.info(f"  [Dreamer] Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)")
+        self.freeze_encoder()  # Re-freeze for PPO
+        
+        # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
         self.model.train()
         
