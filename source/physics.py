@@ -688,8 +688,9 @@ class PhysicsEngine:
             stability_penalty = -self.tilt_penalty
         
         # Goal reaching reward (secondary, modulated by stability)
+        # Use x-y horizontal plane (z is the vertical/UP axis in this physics engine)
         goal_relative = goal_pos - com_pos
-        goal_xy = torch.stack([goal_relative[0], goal_relative[2]])
+        goal_xy = torch.stack([goal_relative[0], goal_relative[1]])
         com_dist = torch.norm(goal_xy)
         
         # Goal reward: reach goal while maintaining balance
@@ -719,39 +720,39 @@ class PhysicsEngine:
         reward, com_dist = self.compute_balance_reward(com_pos, stability_metrics, motor_torques, goal_pos)
         return reward, com_dist, stability_metrics
     
-    def step_batch(self, creatures_batch, motor_torques_batch, goal_pos):
+    def step_batch(self, creatures_batch, motor_torques_batch, goal_pos_batch):
         """
         Vectorized physics step for multiple creatures (GPU-accelerated).
-        
+
         PHASE 4B: Vectorized physics engine - processes entire batch on GPU.
         Enables 100-1000x speedup for 1000+ parallel environments.
-        
+
         Args:
             creatures_batch: list of creatures (tensors already on GPU)
             motor_torques_batch: (num_envs, 12) tensor of motor commands
-            goal_pos: (3,) goal position tensor
-        
+            goal_pos_batch: (num_envs, 3) tensor of per-creature goal positions
+
         Returns:
             rewards_batch: (num_envs,) tensor of rewards
             distances_batch: (num_envs,) tensor of distances to goal
             metrics_batch: dict of batched stability metrics
         """
         from config import Config
-        
+
         num_envs = len(creatures_batch)
-        
+
         # If GPU available and vectorization enabled, use batched kernels
         if HAS_CUDA and self.device.type == 'cuda' and getattr(Config, 'VECTORIZED_PHYSICS', False):
-            return self._step_batch_gpu(creatures_batch, motor_torques_batch, goal_pos)
+            return self._step_batch_gpu(creatures_batch, motor_torques_batch, goal_pos_batch)
         else:
             # Fallback: process sequentially (slower but works on CPU)
             rewards = []
             distances = []
             metrics_list = []
-            
+
             for i, creature in enumerate(creatures_batch):
                 reward, distance, metrics = self._compute_reward(
-                    creature, motor_torques_batch[i], goal_pos
+                    creature, motor_torques_batch[i], goal_pos_batch[i]
                 )
                 rewards.append(reward)
                 distances.append(distance)
@@ -853,7 +854,7 @@ class PhysicsEngine:
 
         return torch.stack(feet, dim=1)  # (N, 4, 3)
 
-    def _step_batch_gpu(self, creatures_batch, motor_torques_batch, goal_pos):
+    def _step_batch_gpu(self, creatures_batch, motor_torques_batch, goal_pos_batch):
         """
         GPU-batched physics using PyTorch vectorised ops (no Numba kernels).
 
@@ -973,7 +974,7 @@ class PhysicsEngine:
                     'energy_consumed': 0.0,
                 },
                 motor_torques_batch[i],
-                goal_pos,
+                goal_pos_batch[i],  # per-creature goal
             )
             rewards_batch.append(reward)
             distances_batch.append(distance)

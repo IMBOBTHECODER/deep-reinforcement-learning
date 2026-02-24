@@ -4,12 +4,11 @@ import math
 import logging
 import os
 import time
-import threading
 import psutil
 import GPUtil
 from concurrent.futures import ThreadPoolExecutor
 from .entity import EntityBelief, init_single_creature, WorldModel
-from .physics import Quaternion, RigidBody, PhysicsEngine
+from .physics import PhysicsEngine
 from config import Config
 
 # Setup logging to file
@@ -25,144 +24,6 @@ logger = logging.getLogger(__name__)
 # Precompute constants to avoid repeated computation in hot loops
 LOG_2PI = math.log(2.0 * math.pi)
 
-
-# ---------------------------------------------------------------------------
-# Resource Monitor
-# ---------------------------------------------------------------------------
-
-def _res_bar(value: float, total: float, width: int = 10) -> str:
-    """Compact ASCII progress bar:  [████████░░]  62.0%"""
-    pct    = max(0.0, min(1.0, value / max(total, 1e-9)))
-    filled = int(round(pct * width))
-    return "[" + "\u2588" * filled + "\u2591" * (width - filled) + "]"
-
-
-class ResourceMonitor:
-    """
-    Background-thread resource sampler.
-
-    Samples CPU / RAM / GPU / VRAM at a fixed interval without blocking the
-    training hot-path.  Writes every snapshot to training.log and prints a
-    single live status line to the console (overwrites itself via \\r).
-
-    Usage::
-
-        monitor = ResourceMonitor(interval=5.0)
-        monitor.update_context(episode=1, step=42, reward=0.87)
-        # runs automatically in background; call shutdown() at program exit
-    """
-
-    def __init__(self, interval: float = 5.0):
-        self._interval = interval
-        self._process  = psutil.Process()
-        self._lock     = threading.Lock()
-
-        # Context updated by the training loop (non-blocking)
-        self._episode : int   = 0
-        self._step    : int   = 0
-        self._reward  : float = 0.0
-
-        # Latest sampled stats (read by main thread for episode summaries)
-        self.latest: dict = {}
-
-        # NVML (pynvml) for accurate GPU / VRAM metrics
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            self._handle   = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_name       = pynvml.nvmlDeviceGetName(self._handle)
-            self._gpu_name = gpu_name.decode() if isinstance(gpu_name, bytes) else gpu_name
-            self._pynvml   = pynvml
-            self._gpu_ok   = True
-        except Exception:
-            self._gpu_ok   = False
-            self._gpu_name = "N/A"
-            self._pynvml   = None
-
-        self._stop   = threading.Event()
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="resource_monitor"
-        )
-        self._thread.start()
-        logger.info(f"[ResourceMonitor] started  interval={interval}s  GPU={self._gpu_name}")
-
-    # ------------------------------------------------------------------
-    def update_context(self, episode: int, step: int, reward: float = 0.0):
-        """Call from training loop to keep status line context current."""
-        with self._lock:
-            self._episode = episode
-            self._step    = step
-            self._reward  = reward
-
-    def shutdown(self):
-        """Stop the background thread and release NVML."""
-        self._stop.set()
-        self._thread.join(timeout=2)
-        if self._gpu_ok:
-            try:
-                self._pynvml.nvmlShutdown()
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    def _sample(self) -> dict:
-        cpu_pct      = psutil.cpu_percent()          # % across all cores
-        ram_proc_mb  = self._process.memory_info().rss / 1024 ** 2
-        sys_vm       = psutil.virtual_memory()
-        stats = {
-            "cpu_pct"      : cpu_pct,
-            "ram_proc_mb"  : ram_proc_mb,
-            "ram_total_mb" : sys_vm.total / 1024 ** 2,
-            "ram_sys_pct"  : sys_vm.percent,
-            "gpu_pct"      : 0.0,
-            "vram_used_mb" : 0.0,
-            "vram_total_mb": 0.0,
-        }
-        if self._gpu_ok:
-            try:
-                util = self._pynvml.nvmlDeviceGetUtilizationRates(self._handle)
-                mem  = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
-                stats["gpu_pct"]       = float(util.gpu)
-                stats["vram_used_mb"]  = mem.used  / 1024 ** 2
-                stats["vram_total_mb"] = mem.total / 1024 ** 2
-            except Exception:
-                pass
-        return stats
-
-    def _loop(self):
-        while not self._stop.is_set():
-            stats = self._sample()
-            with self._lock:
-                self.latest  = stats
-                ep  = self._episode
-                st  = self._step
-                rw  = self._reward
-
-            vram_pct = stats["vram_used_mb"] / max(stats["vram_total_mb"], 1) * 100
-
-            # ── log to file ──────────────────────────────────────────────
-            logger.info(
-                f"[RESOURCES] ep={ep:4d} step={st:6d} reward={rw:+.3f} | "
-                f"CPU={stats['cpu_pct']:5.1f}%  RAM={stats['ram_proc_mb']:7.1f}MB | "
-                f"GPU={stats['gpu_pct']:5.1f}%  "
-                f"VRAM={stats['vram_used_mb']:7.1f}/{stats['vram_total_mb']:.0f}MB "
-                f"({vram_pct:.1f}%)"
-            )
-
-            # ── live console status line (overwrites itself) ──────────────
-            bar_cpu  = _res_bar(stats["cpu_pct"],  100)
-            bar_gpu  = _res_bar(stats["gpu_pct"],  100)
-            bar_vram = _res_bar(vram_pct,           100)
-            line = (
-                f"  CPU {bar_cpu} {stats['cpu_pct']:4.0f}% "
-                f"RAM {stats['ram_proc_mb']:6.0f}/{stats['ram_total_mb']:.0f}MB  "
-                f"| GPU[{self._gpu_name}] {bar_gpu} {stats['gpu_pct']:4.0f}% "
-                f"VRAM {bar_vram} {stats['vram_used_mb']:6.0f}/{stats['vram_total_mb']:.0f}MB  "
-                f"| ep={ep} step={st} r={rw:+.2f}"
-            )
-            print(f"\r{line}", end="", flush=True)
-
-            self._stop.wait(self._interval)
 
 # ===== MULTI-THREADING POOL FOR PHYSICS ======
 # Auto-detect optimal thread count (avoid oversubscription)
@@ -262,8 +123,9 @@ class Environment:
         # World scale for normalization
         self.world_scale_t = torch.tensor([float(self.w), float(self.h), float(self.d)], device=device, dtype=dtype)
         
-        # Goal position (single source of truth on device)
-        self.goal_pos_t = torch.tensor([float(self.w - 5), float(self.h - 5), float(self.d - 1)], device=device, dtype=dtype)
+        # Goal position (single source of truth on device).
+        # z is clamped to BODY_INITIAL_HEIGHT — goals are always on the ground plane.
+        self.goal_pos_t = torch.tensor([float(self.w - 5), float(self.h - 5), float(Config.BODY_INITIAL_HEIGHT)], device=device, dtype=dtype)
         
         # Multi-environment support
         self.use_vectorized = True
@@ -295,12 +157,15 @@ class Environment:
             self.prev_distances[env_id] = self._distance_to_goal(creature)
     
     def _distance_to_goal(self, creature):
-        """Calculate Euclidean distance from creature to goal in 3D space."""
-        dx = creature.pos[0] - self.goal_pos_t[0]
-        dy = creature.pos[1] - self.goal_pos_t[1]
-        dz = creature.pos[2] - self.goal_pos_t[2]
-        dist_sq = dx**2 + dy**2 + dz**2
-        return torch.sqrt(dist_sq)
+        """Calculate Euclidean distance from creature to its goal (x-y plane)."""
+        goal = (
+            creature.goal_pos
+            if (hasattr(creature, 'goal_pos') and creature.goal_pos is not None)
+            else self.goal_pos_t
+        )
+        dx = creature.pos[0] - goal[0]
+        dy = creature.pos[1] - goal[1]
+        return torch.sqrt(dx**2 + dy**2)
     
     def spawn_random_goal(self, env_id=0):
         """
@@ -314,9 +179,14 @@ class Environment:
             # env 3 reaches goal → only its goal changes, others unaffected
             self.spawn_random_goal(env_id=3)
         """
-        x = np.random.uniform(20, self.w - 20)
-        y = np.random.uniform(20, self.h - 20)
-        z = np.random.uniform(0, self.d - 5)
+        x_margin = min(20, self.w // 4)
+        y_margin = min(20, self.h // 4)
+        x = np.random.uniform(x_margin, self.w - x_margin)
+        y = np.random.uniform(y_margin, self.h - y_margin)
+        # Goals are on the ground plane — z=BODY_INITIAL_HEIGHT (~0.3m standing height).
+        # z is the UP axis in this engine (gravity = -z, ground at z=0).
+        # Aerial goals (old: z ∈ [0, d-5] = [0, 59]) are unreachable by ground robots.
+        z = float(Config.BODY_INITIAL_HEIGHT)
         goal = torch.tensor([float(x), float(y), float(z)],
                             device=self.device, dtype=self.dtype)
 
@@ -381,7 +251,19 @@ class TrainingEngine:
             lstm_hidden=Config.LSTM_HIDDEN,
             num_actions=NN_NUM_ACTIONS,
         ).to(device)
-        
+
+        # DataParallel for multi-GPU batch inference (forward() only).
+        # Special methods (forward_sequence, init_state, encoder, policy)
+        # are always accessed via self.model (the raw module).
+        n_gpus = torch.cuda.device_count()
+        self._n_gpus = n_gpus
+        if n_gpus > 1:
+            self._parallel_model = torch.nn.DataParallel(self.model)
+            logger.info(f"[Multi-GPU] DataParallel enabled across {n_gpus} GPUs")
+            print(f"[Multi-GPU] DataParallel enabled across {n_gpus} GPUs")
+        else:
+            self._parallel_model = self.model
+
         self.num_actions = NN_NUM_ACTIONS
         
         # PATTERN A: Pass SHARED encoder to WorldModel
@@ -460,6 +342,17 @@ class TrainingEngine:
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
     
+    def _run_model(self, obs, edge_idx, prev_state):
+        """
+        Model forward pass that uses DataParallel only when the batch is large
+        enough to be split.  Falls back to the raw module for small batches
+        (e.g. single-sample bootstrap steps) to avoid DataParallel's
+        'sub-batch of size 0 on GPU N' error when batch_size < num_gpus.
+        """
+        if self._n_gpus > 1 and obs.shape[0] >= self._n_gpus:
+            return self._parallel_model(obs, edge_idx, prev_state=prev_state)
+        return self.model(obs, edge_idx, prev_state=prev_state)
+
     def load_checkpoint(self):
         """Load model state from checkpoint if available."""
         if not Config.LOAD_CHECKPOINT:
@@ -512,12 +405,6 @@ class TrainingEngine:
         
         # Main loop: run all environments until they all reach max_steps
         for global_step in range(max_steps):
-            # Update monitor context (non-blocking: just writes 3 ints under a lock)
-            if hasattr(self, 'monitor'):
-                self.monitor.update_context(
-                    episode=self.episode_count,
-                    step=global_step,
-                )
             # Collect observations from all environments
             obs_list = []
             for env_id in range(num_envs):
@@ -554,8 +441,8 @@ class TrainingEngine:
                     h_batch = torch.cat(h_list, dim=0)  # (num_active, hidden)
                     c_batch = torch.cat(c_list, dim=0)  # (num_active, hidden)
                     
-                    (mu, log_std), values, (new_h, new_c) = self.model(
-                        obs_batch, edge_idx, prev_state=(h_batch, c_batch)
+                    (mu, log_std), values, (new_h, new_c) = self._run_model(
+                        obs_batch, edge_idx, (h_batch, c_batch)
                     )
                     
                     # Sample actions (Gaussian in R^12, no tanh in policy)
@@ -587,9 +474,14 @@ class TrainingEngine:
                             active_env_ids.append(env_id)
                             env_id_active += 1
                     
-                    # Compute rewards in parallel across CPU threads
-                    reward_results = compute_reward_parallel(
-                        active_creatures, active_actions, self.physics, self.env.goal_pos_t
+                    # Compute rewards + physics step in one GPU-batched call.
+                    # Replaces N sequential CPU _compute_reward calls with a single
+                    # step_batch() dispatch that runs joint dynamics, FK, contacts,
+                    # rigid-body integration and reward on GPU in parallel.
+                    rewards_batch, distances_batch, _ = self.physics.step_batch(
+                        active_creatures,
+                        torch.stack(active_actions),                         # (N_active, 12)
+                        torch.stack([c.goal_pos for c in active_creatures]), # (N_active, 3) per-creature
                     )
                     
                     # Process results for each environment
@@ -608,8 +500,9 @@ class TrainingEngine:
                                 new_c[env_id_active:env_id_active+1]
                             )
                             
-                            # Get pre-computed reward and distance
-                            reward, com_dist = reward_results[env_idx]
+                            # Get pre-computed reward and distance from batched step
+                            reward   = rewards_batch[env_idx]
+                            com_dist = distances_batch[env_idx]
                             
                             # Check if done
                             done = float(com_dist) < self.physics.com_distance_threshold
@@ -665,10 +558,10 @@ class TrainingEngine:
             creature = self.env.creatures[env_id]
             with torch.no_grad():
                 last_obs = self.env.observe(creature)
-                (_, _), bootstrap_val, _ = self.model(
+                (_, _), bootstrap_val, _ = self._run_model(
                     last_obs,
                     self.env.edge_indices[0],
-                    prev_state=creature.rnn_state,
+                    creature.rnn_state,
                 )
             traj[-1]['next_value'] = bootstrap_val.squeeze().detach()
 
@@ -740,7 +633,7 @@ class TrainingEngine:
             
             # Get action from policy (Gaussian in R^12, no tanh in policy)
             with torch.no_grad():
-                (mu, log_std), value, new_state = self.model(obs, edge_idx, prev_state=creature.rnn_state)
+                (mu, log_std), value, new_state = self._run_model(obs, edge_idx, creature.rnn_state)
             
             creature.rnn_state = new_state
             
@@ -758,9 +651,14 @@ class TrainingEngine:
             # Physics clamps the torques anyway
             motor_torques = action[0] # (12,)
             
-            # Apply physics and get reward
+            # Apply physics and get reward (use per-creature goal)
+            goal = (
+                creature.goal_pos
+                if (hasattr(creature, 'goal_pos') and creature.goal_pos is not None)
+                else self.env.goal_pos_t
+            )
             reward, com_dist, stability_metrics = self.physics._compute_reward(
-                creature, motor_torques, self.env.goal_pos_t
+                creature, motor_torques, goal
             )
             
             # Check if goal reached (COM within threshold)
@@ -775,8 +673,8 @@ class TrainingEngine:
             with torch.no_grad():
                 next_obs = self.env.observe(creature)
                 # RNN state carries forward to next goal for continuity
-                (next_mu, next_log_std), next_value, _ = self.model(
-                    next_obs, edge_idx, prev_state=creature.rnn_state
+                (next_mu, next_log_std), next_value, _ = self._run_model(
+                    next_obs, edge_idx, creature.rnn_state
                 )
             
             # Store transition
@@ -857,11 +755,13 @@ class TrainingEngine:
                 # Log probability for 12D Gaussian policy (no tanh)
                 log_prob_seq = -0.5 * ((action_batch - mu_seq) ** 2 / (std ** 2)).sum(dim=1)
                 log_prob_seq = log_prob_seq - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
-                
+
+                # log_ratio must stay outside no_grad so that ratio carries
+                # a gradient back through log_prob_seq → mu_seq → policy_mu.
+                log_ratio = log_prob_seq - old_log_probs
                 with torch.no_grad():
-                    log_ratio = log_prob_seq - old_log_probs
-                    kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
-                
+                    kl = ((torch.exp(log_ratio.detach()) - 1) - log_ratio.detach()).mean()
+
                 ratio = torch.exp(log_ratio)
                 clipped_ratio = torch.clamp(ratio, 1.0 - Config.PPO_CLIP_RATIO, 1.0 + Config.PPO_CLIP_RATIO)
                 policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
@@ -988,14 +888,24 @@ class TrainingEngine:
         dones_batch = torch.cat(all_dones)
         old_log_probs_batch = torch.cat(all_old_log_probs)
         
-        deltas = rewards_batch + self.gamma * next_values_batch.squeeze() * (1 - dones_batch) - values_batch.squeeze()
-        advantages_raw = torch.zeros_like(rewards_batch)
-        gae = 0
-        for t in reversed(range(len(rewards_batch))):
-            gae = deltas[t] + self.gamma * self.gae_lambda * (1 - dones_batch[t]) * gae
-            advantages_raw[t] = gae
-        
-        returns_batch = advantages_raw + values_batch.squeeze()
+        # Compute GAE independently per trajectory to prevent advantage
+        # contamination across environment boundaries.  A single reversed loop
+        # over the concatenated buffer would let the GAE accumulated from
+        # env N+1 bleed backwards into the last steps of env N.
+        all_advantages_raw = []
+        all_returns = []
+        for r_t, v_t, nv_t, d_t in zip(all_rewards, all_values, all_next_values, all_dones):
+            delta_t = r_t + self.gamma * nv_t.squeeze() * (1 - d_t) - v_t.squeeze()
+            adv_t = torch.zeros_like(r_t)
+            gae = 0
+            for t in reversed(range(len(r_t))):
+                gae = delta_t[t] + self.gamma * self.gae_lambda * (1 - d_t[t]) * gae
+                adv_t[t] = gae
+            all_advantages_raw.append(adv_t)
+            all_returns.append(adv_t + v_t.squeeze())
+
+        advantages_raw = torch.cat(all_advantages_raw)
+        returns_batch  = torch.cat(all_returns)
         advantages_batch = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
         
         # Debug: log shapes and value ranges
@@ -1042,11 +952,13 @@ class TrainingEngine:
                 # Log probability for 12D Gaussian policy (no tanh)
                 log_prob_seq = -0.5 * ((action_batch - mu) ** 2 / (std ** 2)).sum(dim=1)
                 log_prob_seq = log_prob_seq - log_std_seq.sum(dim=1) - 0.5 * 12 * LOG_2PI
-                
+
+                # log_ratio must stay outside no_grad so that ratio carries
+                # a gradient back through log_prob_seq → mu_seq → policy_mu.
+                log_ratio = log_prob_seq - old_log_probs_batch
                 with torch.no_grad():
-                    log_ratio = log_prob_seq - old_log_probs_batch
-                    kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
-                
+                    kl = ((torch.exp(log_ratio.detach()) - 1) - log_ratio.detach()).mean()
+
                 ratio = torch.exp(log_ratio)
                 clipped_ratio = torch.clamp(ratio, 1.0 - Config.PPO_CLIP_RATIO, 1.0 + Config.PPO_CLIP_RATIO)
                 policy_loss = -torch.min(ratio * advantages_batch, clipped_ratio * advantages_batch).mean()
@@ -1160,11 +1072,6 @@ class System:
         # Initialize creatures with trained model
         self.env.init_creatures(self.training.model)
         self.edge_index = self.env.edge_indices[0]  # For compatibility
-
-        # Resource monitor (background thread, logs CPU/RAM/GPU/VRAM every 5 s)
-        self.monitor = ResourceMonitor(interval=5.0)
-        # Wire into TrainingEngine so collect_trajectories_vectorized can update context
-        self.training.monitor = self.monitor
     
     def main(self):
         """Main training loop orchestrator."""
@@ -1206,20 +1113,10 @@ class System:
                         self.training.episode_count += 1
                         self.training.save_checkpoint()
                 
-                # ── Episode summary (newline first so it appears below the live bar)
                 ep_secs = time.time() - ep_start
-                s = self.monitor.latest
-                vram_pct = s.get("vram_used_mb", 0) / max(s.get("vram_total_mb", 1), 1) * 100
-                summary = (
-                    f"\n  ep={self.training.episode_count:04d}  "
-                    f"time={ep_secs:.1f}s  "
-                    f"CPU={s.get('cpu_pct', 0):.0f}%  "
-                    f"RAM={s.get('ram_proc_mb', 0):.0f}MB  "
-                    f"GPU={s.get('gpu_pct', 0):.0f}%  "
-                    f"VRAM={s.get('vram_used_mb', 0):.0f}/{s.get('vram_total_mb', 0):.0f}MB({vram_pct:.0f}%)"
-                )
+                summary = f"  ep={self.training.episode_count:04d}  time={ep_secs:.1f}s"
                 print(summary)
-                logger.info(summary.strip())
+                logger.info(summary)
 
                 # Stop training when max episodes reached
                 if self.training.episode_count >= Config.MAX_TRAINING_EPISODES:
@@ -1228,7 +1125,6 @@ class System:
             logger.info("\n" + "=" * 60)
             logger.info("TRAINING COMPLETE")
             logger.info("=" * 60)
-            self.monitor.shutdown()
             
         except Exception as e:
             logger.error(f"[ERROR] Exception during training: {e}")
