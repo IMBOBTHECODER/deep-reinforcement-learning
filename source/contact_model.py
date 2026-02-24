@@ -4,7 +4,6 @@ Separated from main physics engine for clarity.
 """
 
 import numpy as np
-import torch
 
 
 class ContactModel:

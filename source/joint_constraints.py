@@ -8,7 +8,7 @@ import torch
 import math
 import numpy as np
 from enum import Enum
-from typing import Tuple, Optional, List
+from typing import Optional
 from dataclasses import dataclass
 from .physics import Quaternion
 

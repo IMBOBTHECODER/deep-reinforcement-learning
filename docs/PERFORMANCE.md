@@ -1,206 +1,195 @@
 # Performance Optimization Guide
 
-## JIT Kernel Fusion Strategy
+This document covers all current optimizations in the quadruped training system.
+Arranged from innermost hot-path to outer training loop.
 
-This document explains the critical performance optimization that powers the system: **single large compiled kernel** vs multiple small JIT calls.
+---
 
-## The Problem: Boundary Crossing Overhead
+## 1. Numba `@njit` for Scalar Physics (CPU)
 
-When code alternates between Python and compiled JIT functions, there's overhead at each crossing:
+Three functions in `physics.py` are decorated with `@njit(cache=True)`.
+They handle the parts of the per-creature physics step that are inherently
+scalar — quaternion math and the rigid-body integrator — where PyTorch has
+too much per-call overhead for only 4–12 numbers.
 
-```
-SLOW PATTERN (3 boundary crossings):
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-│ Python  │ --> │  JIT A  │ --> │ Python  │ --> │  JIT B  │ --> Python
-└─────────┘     └─────────┘     └─────────┘     └─────────┘
-    ~1-2μs         compute         ~1-2μs         compute        ~1-2μs
-```
+### `_jit_quat_to_rot(w, x, y, z)` → (3, 3)
+Builds a rotation matrix from a quaternion using 9 scalar assignments.
+Called every physics step per creature.  Without `@njit` the cost is a
+Python `np.array([[...]])` call with list-of-list allocation overhead.
 
-Over millions of calls, this overhead compounds:
-- **Scale**: In training, physics simulation happens ~millions of times
-  - 100 environments × 1000 steps/episode × 100 episodes = 10 million calls
-- **Overhead per call**: 1-2 microseconds
-- **Total overhead**: 10-20 seconds just from boundary crossing!
+### `_jit_quat_to_euler(w, x, y, z)` → (pitch, yaw, roll)
+Six trig calls and three `atan2`/`asin` branches compiled to native code.
+Used to sync the creature's orientation tensor from its `RigidBody`.
 
-## The Solution: Kernel Fusion
+### `_jit_integrate_body(pos, vel, ω, q, F, τ, m, I_diag, dt, ω_max)` → (qw, qx, qy, qz)
+The full semi-implicit Euler integrator:
+1. Linear dynamics — velocity + position update
+2. World-frame inertia: `I_world = R @ diag(I_diag) @ R.T`
+3. Euler equations: `I α = τ − ω × (Iω)`, solved with `np.linalg.solve`
+4. Angular velocity clamp
+5. Quaternion integration + normalisation
 
-**Single large kernel eliminates boundary crossing overhead:**
-
-```
-FAST PATTERN (1 boundary crossing):
-┌─────────┐     ┌──────────────────────────────────────┐     ┌─────────┐
-│ Python  │ --> │  LARGE JIT KERNEL                    │ --> │ Python  │
-└─────────┘     │  (Physics + Reward + Observation)    │     └─────────┘
-                │  All computation compiled together    │
-                └──────────────────────────────────────┘
-                    Enter once, stay compiled, exit once
-```
-
-## Implementation: simulation_step() in simulate.py
-
-The kernel is **fused directly into simulate.py** (not imported from another module):
+`pos`, `linear_vel`, `angular_vel` are updated **in-place** (NumPy shared
+memory).  Only the new quaternion scalars are returned.
 
 ```python
-@jit(nopython=True)
-def simulation_step(
-    # State (6 floats): position + velocity
-    pos_x, pos_y, pos_z, vel_x, vel_y, vel_z,
-    
-    # Action (3 floats): acceleration input
-    accel_x, accel_y, accel_z,
-    
-    # World geometry (9 floats): goal + bounds
-    goal_x, goal_y, goal_z,
-    bound_min_x, bound_min_y, bound_min_z,
-    bound_max_x, bound_max_y, bound_max_z,
-    
-    # Physics parameters (11 floats)
-    accel_scale_xy, accel_scale_z, max_accel,
-    max_vel, momentum_damping, gravity,
-    terminal_vel_z, ground_level,
-    ground_friction, air_friction, air_drag,
-    
-    # Reward parameters (8 floats)
-    prev_dist, goal_threshold, proximity_threshold,
-    distance_reward_scale, proximity_bonus_scale, goal_bonus,
-    wall_penalty_scale, stamina_penalty
-    
-) -> tuple:
-    """
-    Complete physics simulation step in one compiled function.
-    
-    Returns: 15 floats
-        - new position (3)
-        - new velocity (3)
-        - reward (1)
-        - current distance (1)
-        - wall penalty (1)
-        - observation (5: 3D relative + 2 absolute)
-    """
-    
-    # PHYSICS PHASE
-    # - Apply acceleration with scaling
-    # - Apply momentum damping
-    # - Apply gravity & collision
-    # - Apply friction/drag
-    # - Clamp velocity
-    # - Update position & boundary clamp
-    
-    # REWARD PHASE
-    # - Calculate distance to goal
-    # - Distance-based reward (2x penalty for moving away)
-    # - Goal reached bonus
-    # - Proximity bonus
-    # - Wall penetration penalty
-    
-    # OBSERVATION PHASE
-    # - Normalize goal-relative position
-    # - Normalize absolute position
-    
-    return (clamped_x, clamped_y, clamped_z,
-            new_vel_x, new_vel_y, new_vel_z,
-            reward, curr_dist, wall_penalty,
-            obs_rel_x, obs_rel_y, obs_rel_z,
-            obs_abs_x, obs_abs_y, obs_abs_z)
-```
-
-## Why Direct Inlining Matters
-
-The kernel is **fused into simulate.py** (not imported from helper_math):
-
-**Advantages**:
-- No module import lookup cost
-- Numba compiler sees full context (all parameters at once)
-- Easier to understand physics logic (everything in one place)
-- Fewer file imports in critical path
-
-**How to use it**:
-```python
-# In simulate.py
-result = simulation_step(
-    pos.x, pos.y, pos.z, vel.x, vel.y, vel.z,
-    action.x, action.y, action.z,
-    goal.x, goal.y, goal.z,
-    # ... 38 more parameters ...
+# physics.py — called N times per step (once per creature)
+new_qw, new_qx, new_qy, new_qz = _jit_integrate_body(
+    body.pos, body.linear_vel, body.angular_vel,
+    body.orientation.w, body.orientation.x,
+    body.orientation.y, body.orientation.z,
+    force_accum, torque_accum,
+    mass, np.diag(inertia_tensor),
+    dt, MAX_ANGULAR_VELOCITY,
 )
-
-new_x, new_y, new_z, new_vx, new_vy, new_vz, reward, dist, penalty, *obs = result
 ```
 
-## Performance Impact
+All three functions are **cache=True** — compiled once, persisted to
+`__pycache__`, zero recompile cost on subsequent runs.
 
-**Measurements**:
-- Single JIT call (fused): ~0.5-1.0 microsecond per step
-- Previous approach (3 JIT calls): ~3-5 microseconds per step
-- **Speedup**: 3-5x faster physics simulation
+**Fallback**: If `numba` is not installed the module defines a no-op `njit`
+decorator; the functions run as plain NumPy with identical results.
 
-**Example training impact**:
-```
-Before fusion:
-100 envs × 1000 steps × 100 episodes × 4 microseconds = 40 seconds physics time
+---
 
-After fusion:
-100 envs × 1000 steps × 100 episodes × 1 microsecond = 10 seconds physics time
+## 2. Vectorised Contact Detection (NumPy, per-creature path)
 
-Total training speedup: ~20% (depends on training/physics ratio)
-```
+Inside `_update_joint_dynamics_cpu`, the old 4-iteration Python `for` loop
+over feet is replaced with NumPy slice operations on `(4,)` arrays:
 
-## When to Fuse, When to Split
-
-### Fuse together:
-- ✅ Frequently called hot-path functions (millions/episode)
-- ✅ Related computations (physics depends on position→reward depends on physics)
-- ✅ Functions with many shared parameters
-
-### Keep separate:
-- ✅ Rarely called functions (load/save checkpoints, visualization)
-- ✅ Unrelated domains (world model uses different logic)
-- ✅ Functions with very different parameter sets
-
-## Implementation Checklist
-
-If adding new physics features:
-
-1. **Add parameters to simulation_step()** (declare at top)
-2. **Implement logic inside the kernel** (keep it scalar, no allocations)
-3. **Update return tuple** if new outputs needed
-4. **Update move() call** in System.move() to pass new parameters
-5. **Benchmark**: Compare single JIT call vs multiple small calls
-
-## Numba JIT Compilation Rules
-
-**Requirements for nopython=True mode**:
-- ✅ No Python API calls (no .append(), no print, no exceptions)
-- ✅ Only scalar math (floats, ints, basic ops)
-- ✅ No NumPy arrays (use scalar parameters)
-- ✅ Type-stable (variable types don't change)
-- ❌ No list comprehensions
-- ❌ No dictionary operations
-- ❌ No string operations
-
-**Compilation happens once** on first call, then runs at near-C speed.
-
-## Profiling
-
-To measure physics overhead:
 ```python
-import time
-
-# Before physics
-t0 = time.perf_counter()
-
-# 1000 physics steps
-for _ in range(1000):
-    result = simulation_step(...)
-
-# After physics
-t1 = time.perf_counter()
-print(f"1000 steps: {(t1-t0)*1e6:.1f} microseconds average")
+# One .numpy() call instead of four float() casts
+foot_z_np    = foot_positions[:, 2].detach().cpu().numpy()   # (4,)
+contact_mask = foot_z_np <= ground_level + threshold          # (4,) bool
+pens         = np.maximum(0, ground_level - foot_z_np) * contact_mask
+spring       = contact_stiffness * pens
+resti        = contact_restitution * (-bvz) * spring / np.maximum(pens, 0.001)
+contact_force_total[2] = np.sum(np.maximum(0, spring - damper + resti) * contact_mask)
 ```
+
+The `* contact_mask` at the end prevents spurious forces on airborne feet
+when `body_vz < 0` (falling body makes damper term negative).
+
+---
+
+## 3. Batched PyTorch CUDA Ops (`_step_batch_gpu`)
+
+When `VECTORIZED_PHYSICS = True` and a CUDA device is present, all N
+environments are processed together instead of in a Python `for` loop.
+
+| Section | Tensors | What replaces |
+|---|---|---|
+| Joint dynamics | `(N, 12)` elementwise | N × per-creature calls |
+| Forward kinematics | 4 × `torch.bmm` on `(N, 3, 3)` | N × 4-leg FK loops |
+| Contact detection | `(N, 4)` comparison | N × 4-foot Python loops |
+| Spring-damper | `(N, 4)` elementwise | N × 4-foot force loops |
+
+PyTorch dispatches each op to cuBLAS / cuDNN and selects the optimal
+grid/block layout automatically — no Numba CUDA kernels needed.  This
+eliminates the old "Grid size 1" under-utilisation warning that appeared
+when a Numba kernel was launched with only 12 work items.
+
+```
+Before (_step_batch_gpu ran a Python for-loop):
+  16 envs × 4 legs × 3 segments  =  192 separate function calls
+  16 × 4 FK calls inside Python loop
+
+After (batched):
+  Joint dynamics:  3 elementwise ops on (16, 12)       ← 1 CUDA launch
+  FK:              4 × bmm on (16, 3, 3)               ← 4 CUDA launches
+  Contact/forces:  5 elementwise ops on (16, 4)        ← 1 CUDA launch
+```
+
+### `_batch_forward_kinematics` detail
+
+```python
+# Rotation matrices for all N creatures — one stack call per axis
+Rx = torch.stack([...], dim=1)   # (N, 3, 3)
+Ry = torch.stack([...], dim=1)
+Rz = torch.stack([...], dim=1)
+R  = torch.bmm(torch.bmm(Rz, Ry), Rx)   # (N, 3, 3) combined
+
+# Each of the 4 legs: cumulative pitch-plane offset + hip rotation
+for leg_idx in range(4):          # only 4 iterations (not N)
+    p3_world = torch.bmm(R, p3.unsqueeze(-1)).squeeze(-1)   # (N, 3)
+    feet.append(hip_world + p3_world)
+
+return torch.stack(feet, dim=1)  # (N, 4, 3)
+```
+
+---
+
+## 4. Batch Encoder in PPO (`forward_sequence`)
+
+```python
+# Before — T × num_envs × PPO_EPOCHS separate (1, 34) calls:
+for obs in obs_list:                    # 1 024 iterations
+    (mu, log_std), value, state = model(obs, ...)
+
+# After — one (T, 34) matmul, then LSTM loop for done-masking:
+obs_seq = torch.cat(obs_list, dim=0)    # (T, 34)
+(mu_seq, log_std_seq), val_seq, _ = model.forward_sequence(obs_seq, dones=dones)
+```
+
+| | Before | After |
+|---|---|---|
+| Encoder calls per episode | T × envs × epochs = 65 536 | envs × epochs = 64 |
+| Shape per call | (1, 34) | (1 024, 34) |
+
+---
+
+## 5. ResourceMonitor — Background Thread
+
+The `ResourceMonitor` class in `simulate.py` samples CPU / RAM / GPU / VRAM
+in a **daemon thread** — it never touches the training hot-path.
+
+```
+Training thread (hot path):
+  step 0 → step 1 → step 2 → ...   ← never blocks
+
+Monitor thread (background, every 5 s):
+  sample → log → print \r status bar
+```
+
+**Live console bar** (overwrites the same line):
+```
+  CPU [████████░░]  82% RAM   1234/16384MB  | GPU[Tesla T4] [██████░░░░]  61% VRAM   4096/16160MB  | ep=3 step=412 r=+0.87
+```
+
+**Every sample is written to `training.log`**:
+```
+2026-02-24 10:31:05 - INFO - [RESOURCES] ep=   3 step=   412 reward=+0.870 | CPU= 82.1%  RAM=  1234.5MB | GPU= 61.0%  VRAM=  4096.0/16160MB (25.3%)
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `interval` | 5.0 s | How often to sample |
+| GPU backend | pynvml | Accurate direct NVML query |
+| Fallback | GPUtil | If pynvml not installed |
+
+---
+
+## 6. Numba JIT Rules
+
+`@njit` functions must follow these rules (enforced at compile time):
+
+| Allowed | Not allowed |
+|---|---|
+| Scalar math (float, int) | Python API calls (print, append) |
+| NumPy array creation (`np.empty`, `np.zeros`) | List comprehensions |
+| `math.*` trig | Dictionary operations |
+| `np.linalg.solve` / `np.linalg.norm` | String operations |
+| In-place array ops (`arr[i] += x`) | Object creation / class methods |
+
+Compilation happens **once** on the first call, then runs at near-C speed.
+`cache=True` persists the compiled binary to `__pycache__` so subsequent
+program starts skip recompilation entirely.
+
+---
 
 ## Related Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md#performance-jit-kernel-fusion-architecture) - System design
-- [WORLD_SYSTEM.md](WORLD_SYSTEM.md#physics-system) - Physics details
-- [QUICKSTART.md](QUICKSTART.md) - Getting started
+- [ARCHITECTURE.md](ARCHITECTURE.md) — System design and data flow
+- [PHYSICS.md](PHYSICS.md) — Full physics engine reference
+- [PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md) — 250 Hz, contacts, vectorization
 

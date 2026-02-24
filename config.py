@@ -16,7 +16,7 @@ class Config:
     # ============ VECTORIZED MULTI-ENVIRONMENT TRAINING ============
     # Always enabled: Multiple agents train in parallel for efficiency
     NUM_ENVS = None  # Auto-detect based on available memory
-    MAX_ENVS = 16
+    MAX_ENVS = 32
     MIN_ENVS = 2
     MAX_DATA_THRESHOLD_MB = 8192
     
@@ -62,10 +62,10 @@ class Config:
     # Always enabled: CPU threads handle physics when GPU not available
     NUM_PHYSICS_THREADS = None  # None = auto-detect (typically num_cpus - 1)
     
-    # ============ GPU ACCELERATION & VECTORIZATION (Numba CUDA) ============
-    # Phase 4b: GPU-accelerated vectorized physics for 1000+ environments
-    GPU_THREADS_PER_BLOCK = 1024  # Threads per block (1024 for RTX cards, 512 for older)
-    VECTORIZED_PHYSICS = True  # Enable batched physics kernel (1000+ envs on GPU)
+    # ============ GPU ACCELERATION & VECTORIZATION ============
+    # step_batch() uses batched PyTorch CUDA ops (no Numba kernels).
+    # PyTorch selects optimal grid/block sizes automatically.
+    VECTORIZED_PHYSICS = True  # Enable batched physics for multi-env GPU training
     
     # ============ BALANCE TASK REWARD SHAPING ============
     # Goal: Keep center of mass (COM) close to goal position

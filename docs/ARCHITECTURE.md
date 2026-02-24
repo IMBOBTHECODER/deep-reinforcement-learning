@@ -167,30 +167,43 @@ See [PHYSICS_ENGINE_UPGRADES.md](PHYSICS_ENGINE_UPGRADES.md) for complete detail
 
 ---
 
-### GPU-Accelerated Physics (PREVIOUS - Still Applies)
+### CPU-Path Optimisations (`@njit` scalar JIT)
 
-Joint dynamics now execute on GPU using Numba CUDA kernels:
+Three `@njit(cache=True)` functions in `physics.py` handle the per-creature
+scalar ops that are too small to benefit from GPU batching:
+
+| Function | What it JIT-compiles |
+|---|---|
+| `_jit_quat_to_rot` | Quaternion → 3×3 rotation matrix (9 scalar assignments) |
+| `_jit_quat_to_euler` | Quaternion → (pitch, yaw, roll) (6 trig calls) |
+| `_jit_integrate_body` | Full semi-implicit Euler integrator (linear + angular dynamics + quat integration) |
+
+`_jit_integrate_body` modifies `pos` / `linear_vel` / `angular_vel` in-place
+(shared NumPy memory) and returns only the 4 updated quaternion scalars,
+avoiding any allocation in the hot loop.
+
+Fallback: if `numba` is not installed, a no-op `njit` decorator is defined;
+functions run as plain NumPy with identical results.
+
+### GPU-Batched Physics (`_step_batch_gpu`)
+
+With `VECTORIZED_PHYSICS = True` all N environments are processed together:
 
 ```
-BEFORE (CPU-bound):
-  GPU: Policy → Action [fast] → [IDLE waiting]
-  CPU: Joint updates (12 joints sequentially) [slow, blocks GPU]
+BEFORE (sequential loop inside _step_batch_gpu):
+  for creature in creatures_batch:          # N iterations
+      update_joints(creature)               # per-creature
+      forward_kinematics(creature)          # per-creature
+      contact_detection(creature)           # per-creature
 
-AFTER (GPU-accelerated):
-  GPU: Policy → Action [fast] → Joint updates (12 joints in parallel) [fast]
-  CPU: Rest of environment management (observations, contacts, rewards)
+AFTER (batched PyTorch ops):
+  Joint dynamics  → 3 elementwise ops on (N, 12)         ← 1 kernel launch
+  Forward kinematics → 4 × bmm on (N, 3, 3)             ← 4 kernel launches
+  Contact/spring-damper → 5 elementwise ops on (N, 4)   ← 1 kernel launch
 ```
 
-**Joint Update Kernel (GPU)**:
-- 1 thread per joint (12 parallel threads)
-- Computes: `v += (torque - damping*v)*dt`, clamps, updates angles
-- **2-3x faster** than CPU PyTorch sequential ops
-- Fallback to CPU if CUDA unavailable
-
-Benefits:
-- **T4 GPU Utilization**: From 30-35% → 50-70% (joint updates now GPU-resident)
-- **Joint Update Speed**: From CPU bottleneck → GPU parallel
-- **Backward Compatible**: Auto-detects CUDA, falls back gracefully
+PyTorch selects the optimal grid/block layout automatically — no Numba CUDA
+kernels needed, and no "Grid size 1" warning.
 
 ### Multi-Core Physics Rewards (Previous Optimization)
 
@@ -343,45 +356,27 @@ END
     └── load_checkpoint()
 ```
 
-### Performance: JIT Kernel Fusion Architecture
+### ResourceMonitor
 
-**The Critical Optimization Pattern**:
+A background daemon thread in `simulate.py` samples hardware usage every 5 s
+without blocking the training hot-path.
+
 ```
-SLOW: Python → JIT_A() → Python → JIT_B() → Python → JIT_C() → Python
-      [3 boundary crossings, context switches, overhead]
-
-FAST: Python → [LARGE_JIT_KERNEL(physics + reward + obs)] → Python
-      [1 boundary crossing, compiler optimizes everything together]
+Training thread:   step 0 → step 1 → step 2 → ...   (never blocks)
+Monitor thread:    sample → log → print \r bar        (daemon, every 5 s)
 ```
 
-**Why Fusion Matters**:
-- **Boundary Crossing Cost**: Each Python↔JIT transition has overhead (~1-2μs)
-- **Scale**: In training, move() called ~millions of times (3+ boundary crossings each)
-- **Solution**: Single large compiled kernel eliminates transition overhead
-- **Location**: Kernel fused directly into simulate.py (zero import overhead)
+Outputs:
+- **Live console bar** (overwrites a single line via `\r`):
+  `CPU [████████░░]  82% RAM  1234/16384MB  | GPU[Tesla T4] [██████░░░░]  61% VRAM  4096/16160MB`
+- **Episode summary** printed after every episode with timing and resource snapshot
+- **`training.log`** — every sample is written with `[RESOURCES]` tag for post-hoc analysis
 
-**Kernel Specification** (simulation_step in simulate.py):
-```python
-@jit(nopython=True)
-def simulation_step(
-    # State (6 floats)
-    pos_x, pos_y, pos_z, vel_x, vel_y, vel_z,
-    # Action (3 floats)
-    accel_x, accel_y, accel_z,
-    # World (9 floats)
-    goal_x, goal_y, goal_z,
-    bound_min_x, bound_min_y, bound_min_z,
-    bound_max_x, bound_max_y, bound_max_z,
-    # Physics params (11 floats)
-    accel_scale_xy, accel_scale_z, max_accel, max_vel,
-    momentum_damping, gravity, terminal_vel_z, ground_level,
-    ground_friction, air_friction, air_drag,
-    # Reward params (8 floats)
-    prev_dist, goal_threshold, proximity_threshold,
-    distance_reward_scale, proximity_bonus_scale, goal_bonus,
-    wall_penalty_scale, stamina_penalty
-) -> tuple:  # 15 floats: pos(3) + vel(3) + reward + dist + penalty + obs(5)
-```
+`update_context(episode, step)` is called each collection step (just writes
+two ints under a lock — ~100 ns overhead).
+
+`monitor.shutdown()` is called on training completion to join the thread and
+release the NVML handle cleanly.
 
 ### Vectorization Details
 

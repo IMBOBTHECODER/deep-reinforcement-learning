@@ -3,6 +3,8 @@ import torch
 import math
 import logging
 import os
+import time
+import threading
 import psutil
 import GPUtil
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,145 @@ logger = logging.getLogger(__name__)
 
 # Precompute constants to avoid repeated computation in hot loops
 LOG_2PI = math.log(2.0 * math.pi)
+
+
+# ---------------------------------------------------------------------------
+# Resource Monitor
+# ---------------------------------------------------------------------------
+
+def _res_bar(value: float, total: float, width: int = 10) -> str:
+    """Compact ASCII progress bar:  [████████░░]  62.0%"""
+    pct    = max(0.0, min(1.0, value / max(total, 1e-9)))
+    filled = int(round(pct * width))
+    return "[" + "\u2588" * filled + "\u2591" * (width - filled) + "]"
+
+
+class ResourceMonitor:
+    """
+    Background-thread resource sampler.
+
+    Samples CPU / RAM / GPU / VRAM at a fixed interval without blocking the
+    training hot-path.  Writes every snapshot to training.log and prints a
+    single live status line to the console (overwrites itself via \\r).
+
+    Usage::
+
+        monitor = ResourceMonitor(interval=5.0)
+        monitor.update_context(episode=1, step=42, reward=0.87)
+        # runs automatically in background; call shutdown() at program exit
+    """
+
+    def __init__(self, interval: float = 5.0):
+        self._interval = interval
+        self._process  = psutil.Process()
+        self._lock     = threading.Lock()
+
+        # Context updated by the training loop (non-blocking)
+        self._episode : int   = 0
+        self._step    : int   = 0
+        self._reward  : float = 0.0
+
+        # Latest sampled stats (read by main thread for episode summaries)
+        self.latest: dict = {}
+
+        # NVML (pynvml) for accurate GPU / VRAM metrics
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._handle   = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_name       = pynvml.nvmlDeviceGetName(self._handle)
+            self._gpu_name = gpu_name.decode() if isinstance(gpu_name, bytes) else gpu_name
+            self._pynvml   = pynvml
+            self._gpu_ok   = True
+        except Exception:
+            self._gpu_ok   = False
+            self._gpu_name = "N/A"
+            self._pynvml   = None
+
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="resource_monitor"
+        )
+        self._thread.start()
+        logger.info(f"[ResourceMonitor] started  interval={interval}s  GPU={self._gpu_name}")
+
+    # ------------------------------------------------------------------
+    def update_context(self, episode: int, step: int, reward: float = 0.0):
+        """Call from training loop to keep status line context current."""
+        with self._lock:
+            self._episode = episode
+            self._step    = step
+            self._reward  = reward
+
+    def shutdown(self):
+        """Stop the background thread and release NVML."""
+        self._stop.set()
+        self._thread.join(timeout=2)
+        if self._gpu_ok:
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    def _sample(self) -> dict:
+        cpu_pct      = psutil.cpu_percent()          # % across all cores
+        ram_proc_mb  = self._process.memory_info().rss / 1024 ** 2
+        sys_vm       = psutil.virtual_memory()
+        stats = {
+            "cpu_pct"      : cpu_pct,
+            "ram_proc_mb"  : ram_proc_mb,
+            "ram_total_mb" : sys_vm.total / 1024 ** 2,
+            "ram_sys_pct"  : sys_vm.percent,
+            "gpu_pct"      : 0.0,
+            "vram_used_mb" : 0.0,
+            "vram_total_mb": 0.0,
+        }
+        if self._gpu_ok:
+            try:
+                util = self._pynvml.nvmlDeviceGetUtilizationRates(self._handle)
+                mem  = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+                stats["gpu_pct"]       = float(util.gpu)
+                stats["vram_used_mb"]  = mem.used  / 1024 ** 2
+                stats["vram_total_mb"] = mem.total / 1024 ** 2
+            except Exception:
+                pass
+        return stats
+
+    def _loop(self):
+        while not self._stop.is_set():
+            stats = self._sample()
+            with self._lock:
+                self.latest  = stats
+                ep  = self._episode
+                st  = self._step
+                rw  = self._reward
+
+            vram_pct = stats["vram_used_mb"] / max(stats["vram_total_mb"], 1) * 100
+
+            # ── log to file ──────────────────────────────────────────────
+            logger.info(
+                f"[RESOURCES] ep={ep:4d} step={st:6d} reward={rw:+.3f} | "
+                f"CPU={stats['cpu_pct']:5.1f}%  RAM={stats['ram_proc_mb']:7.1f}MB | "
+                f"GPU={stats['gpu_pct']:5.1f}%  "
+                f"VRAM={stats['vram_used_mb']:7.1f}/{stats['vram_total_mb']:.0f}MB "
+                f"({vram_pct:.1f}%)"
+            )
+
+            # ── live console status line (overwrites itself) ──────────────
+            bar_cpu  = _res_bar(stats["cpu_pct"],  100)
+            bar_gpu  = _res_bar(stats["gpu_pct"],  100)
+            bar_vram = _res_bar(vram_pct,           100)
+            line = (
+                f"  CPU {bar_cpu} {stats['cpu_pct']:4.0f}% "
+                f"RAM {stats['ram_proc_mb']:6.0f}/{stats['ram_total_mb']:.0f}MB  "
+                f"| GPU[{self._gpu_name}] {bar_gpu} {stats['gpu_pct']:4.0f}% "
+                f"VRAM {bar_vram} {stats['vram_used_mb']:6.0f}/{stats['vram_total_mb']:.0f}MB  "
+                f"| ep={ep} step={st} r={rw:+.2f}"
+            )
+            print(f"\r{line}", end="", flush=True)
+
+            self._stop.wait(self._interval)
 
 # ===== MULTI-THREADING POOL FOR PHYSICS ======
 # Auto-detect optimal thread count (avoid oversubscription)
@@ -371,6 +512,12 @@ class TrainingEngine:
         
         # Main loop: run all environments until they all reach max_steps
         for global_step in range(max_steps):
+            # Update monitor context (non-blocking: just writes 3 ints under a lock)
+            if hasattr(self, 'monitor'):
+                self.monitor.update_context(
+                    episode=self.episode_count,
+                    step=global_step,
+                )
             # Collect observations from all environments
             obs_list = []
             for env_id in range(num_envs):
@@ -1013,6 +1160,11 @@ class System:
         # Initialize creatures with trained model
         self.env.init_creatures(self.training.model)
         self.edge_index = self.env.edge_indices[0]  # For compatibility
+
+        # Resource monitor (background thread, logs CPU/RAM/GPU/VRAM every 5 s)
+        self.monitor = ResourceMonitor(interval=5.0)
+        # Wire into TrainingEngine so collect_trajectories_vectorized can update context
+        self.training.monitor = self.monitor
     
     def main(self):
         """Main training loop orchestrator."""
@@ -1033,6 +1185,8 @@ class System:
             trajectories_batch = []
             
             while not training_complete:
+                ep_start = time.time()
+
                 if self.env.use_vectorized:
                     # Parallel trajectory collection across all environments
                     trajectories_batch = self.training.collect_trajectories_vectorized(max_steps=Config.MAX_STEPS_PER_EPISODE)
@@ -1052,6 +1206,21 @@ class System:
                         self.training.episode_count += 1
                         self.training.save_checkpoint()
                 
+                # ── Episode summary (newline first so it appears below the live bar)
+                ep_secs = time.time() - ep_start
+                s = self.monitor.latest
+                vram_pct = s.get("vram_used_mb", 0) / max(s.get("vram_total_mb", 1), 1) * 100
+                summary = (
+                    f"\n  ep={self.training.episode_count:04d}  "
+                    f"time={ep_secs:.1f}s  "
+                    f"CPU={s.get('cpu_pct', 0):.0f}%  "
+                    f"RAM={s.get('ram_proc_mb', 0):.0f}MB  "
+                    f"GPU={s.get('gpu_pct', 0):.0f}%  "
+                    f"VRAM={s.get('vram_used_mb', 0):.0f}/{s.get('vram_total_mb', 0):.0f}MB({vram_pct:.0f}%)"
+                )
+                print(summary)
+                logger.info(summary.strip())
+
                 # Stop training when max episodes reached
                 if self.training.episode_count >= Config.MAX_TRAINING_EPISODES:
                     training_complete = True
@@ -1059,6 +1228,7 @@ class System:
             logger.info("\n" + "=" * 60)
             logger.info("TRAINING COMPLETE")
             logger.info("=" * 60)
+            self.monitor.shutdown()
             
         except Exception as e:
             logger.error(f"[ERROR] Exception during training: {e}")
