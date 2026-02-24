@@ -5,7 +5,6 @@ import logging
 import os
 import psutil
 import GPUtil
-from numba import jit
 from concurrent.futures import ThreadPoolExecutor
 from .entity import EntityBelief, init_single_creature, WorldModel
 from .physics import Quaternion, RigidBody, PhysicsEngine
@@ -38,192 +37,25 @@ physics_thread_pool = ThreadPoolExecutor(
     thread_name_prefix="physics_worker"
 )
 
-# ===== JIT SIMULATION KERNEL (fused for maximum performance) =====
-@jit(nopython=True)
-def simulation_step(
-    # Position & Velocity (agent)
-    pos_x: float, pos_y: float, pos_z: float,
-    vel_x: float, vel_y: float, vel_z: float,
-    
-    # Action (acceleration input)
-    accel_x: float, accel_y: float, accel_z: float,
-    
-    # Goal position
-    goal_x: float, goal_y: float, goal_z: float,
-    
-    # World bounds
-    bound_min_x: float, bound_min_y: float, bound_min_z: float,
-    bound_max_x: float, bound_max_y: float, bound_max_z: float,
-    world_size_x: float, world_size_y: float, world_size_z: float,
-    
-    # Physics parameters
-    accel_scale_xy: float, accel_scale_z: float, max_accel: float,
-    max_vel: float, momentum_damping: float, gravity: float,
-    terminal_vel_z: float, ground_level: float,
-    ground_friction: float, air_friction: float, air_drag: float,
-    
-    # Reward parameters
-    prev_dist: float, goal_threshold: float, proximity_threshold: float,
-    distance_reward_scale: float, proximity_bonus_scale: float, goal_bonus: float,
-    wall_penalty_scale: float
-) -> tuple:
-    """
-    Complete simulation step kernel: movement, physics, reward, observation.
-    All in one compiled function for zero boundary crossing overhead.
-    
-    Returns:
-        (new_pos_x, new_pos_y, new_pos_z,
-         new_vel_x, new_vel_y, new_vel_z,
-         reward, curr_dist, wall_penalty,
-         obs_rel_x, obs_rel_y, obs_rel_z,
-         obs_abs_x, obs_abs_y, obs_abs_z)
-    """
-    
-    # ===== PHYSICS UPDATE =====
-    
-    # 1. Scale acceleration by direction
-    accel_x_scaled = accel_x * accel_scale_xy
-    accel_y_scaled = accel_y * accel_scale_xy
-    accel_z_scaled = accel_z * accel_scale_z
-    
-    # 2. Clamp acceleration magnitude
-    accel_mag = (accel_x_scaled * accel_x_scaled + 
-                 accel_y_scaled * accel_y_scaled + 
-                 accel_z_scaled * accel_z_scaled) ** 0.5
-    
-    if accel_mag > max_accel:
-        scale = max_accel / accel_mag
-        accel_x_scaled *= scale
-        accel_y_scaled *= scale
-        accel_z_scaled *= scale
-    
-    # 3. Momentum damping
-    new_vel_x = vel_x * (1.0 - momentum_damping)
-    new_vel_y = vel_y * (1.0 - momentum_damping)
-    new_vel_z = vel_z * (1.0 - momentum_damping)
-    
-    # 4. Apply acceleration
-    new_vel_x += accel_x_scaled
-    new_vel_y += accel_y_scaled
-    new_vel_z += accel_z_scaled
-    
-    # 5. Gravity & ground collision
-    on_ground = pos_z <= ground_level
-    
-    if on_ground:
-        new_vel_z = max(0.0, new_vel_z)  # Don't penetrate ground
-    else:
-        new_vel_z -= gravity
-        new_vel_z = max(new_vel_z, terminal_vel_z)  # Cap falling speed
-    
-    # 6. Apply drag
-    if on_ground:
-        horiz_speed = (new_vel_x * new_vel_x + new_vel_y * new_vel_y) ** 0.5
-        if horiz_speed > 1e-6:
-            drag_factor = max(0.0, 1.0 - (ground_friction * horiz_speed))
-            new_vel_x *= drag_factor
-            new_vel_y *= drag_factor
-    else:
-        vel_mag = (new_vel_x * new_vel_x + new_vel_y * new_vel_y + new_vel_z * new_vel_z) ** 0.5
-        if vel_mag > 1e-6:
-            # Quadratic air drag
-            drag_mag = air_drag * vel_mag * vel_mag
-            drag_scale = -drag_mag / vel_mag
-            new_vel_x += new_vel_x * drag_scale
-            new_vel_y += new_vel_y * drag_scale
-            new_vel_z += new_vel_z * drag_scale
-            
-            # Air friction
-            new_vel_x *= (1.0 - air_friction)
-            new_vel_y *= (1.0 - air_friction)
-    
-    # 7. Clamp velocity
-    vel_mag = (new_vel_x * new_vel_x + new_vel_y * new_vel_y + new_vel_z * new_vel_z) ** 0.5
-    if vel_mag > max_vel:
-        scale = max_vel / vel_mag
-        new_vel_x *= scale
-        new_vel_y *= scale
-        new_vel_z *= scale
-    
-    # 8. Update position
-    new_pos_x = pos_x + new_vel_x
-    new_pos_y = pos_y + new_vel_y
-    new_pos_z = pos_z + new_vel_z
-    
-    # 9. Clamp to boundaries (inline to avoid function call)
-    clamped_x = max(bound_min_x, min(new_pos_x, bound_max_x))
-    clamped_y = max(bound_min_y, min(new_pos_y, bound_max_y))
-    clamped_z = max(bound_min_z, min(new_pos_z, bound_max_z))
-    
-    penetration = abs(new_pos_x - clamped_x) + abs(new_pos_y - clamped_y) + abs(new_pos_z - clamped_z)
-    wall_penalty = -wall_penalty_scale * penetration
-    
-    # ===== OBSERVATION COMPUTATION =====
-    # Inline normalization (no function call)
-    inv_x = 1.0 / world_size_x
-    inv_y = 1.0 / world_size_y
-    inv_z = 1.0 / world_size_z
-    
-    obs_rel_x = (goal_x - clamped_x) * inv_x
-    obs_rel_y = (goal_y - clamped_y) * inv_y
-    obs_rel_z = (goal_z - clamped_z) * inv_z
-    
-    obs_abs_x = clamped_x * inv_x
-    obs_abs_y = clamped_y * inv_y
-    obs_abs_z = clamped_z * inv_z
-    
-    # ===== REWARD COMPUTATION =====
-    # Distance to goal
-    dx = clamped_x - goal_x
-    dy = clamped_y - goal_y
-    dz = clamped_z - goal_z
-    curr_dist = (dx * dx + dy * dy + dz * dz) ** 0.5
-    
-    # Distance change reward
-    distance_delta = prev_dist - curr_dist
-    if distance_delta > 0:
-        distance_reward = distance_delta * distance_reward_scale
-    else:
-        distance_reward = distance_delta * distance_reward_scale * 2.0  # 2x penalty
-    
-    # Goal bonus
-    goal_reached = 1.0 if curr_dist < goal_threshold else 0.0
-    goal_reward = goal_reached * goal_bonus
-    
-    # Proximity bonus
-    proximity_reached = 1.0 if curr_dist < proximity_threshold else 0.0
-    proximity_reward = proximity_reached * (proximity_threshold - curr_dist) * proximity_bonus_scale
-    
-    # Total reward
-    reward = goal_reward + distance_reward + proximity_reward + wall_penalty
-    
-    return (
-        clamped_x, clamped_y, clamped_z,
-        new_vel_x, new_vel_y, new_vel_z,
-        reward, curr_dist, wall_penalty,
-        obs_rel_x, obs_rel_y, obs_rel_z,
-        obs_abs_x, obs_abs_y, obs_abs_z
-    )
-
-
-def compute_reward_parallel(creatures, motor_torques_list, physics_engine, goal_pos):
+def compute_reward_parallel(creatures, motor_torques_list, physics_engine, goal_pos=None):
     """
     Compute rewards for multiple creatures in parallel using ThreadPoolExecutor.
-    This distributes CPU-heavy physics calculations across multiple cores.
-    
-    Args:
-        creatures: list of creature objects
-        motor_torques_list: list of motor torque tensors
-        physics_engine: PhysicsEngine instance
-        goal_pos: goal position tensor
-    
-    Returns:
-        list of (reward, com_dist) tuples
+
+    Per-creature goal: each creature carries its own goal_pos so that
+    different environments can pursue independent targets simultaneously.
+    The shared `goal_pos` argument is used only as a fallback.
+
+    Example:
+        # Each creature has been given its own goal via spawn_random_goal(env_id)
+        results = compute_reward_parallel(creatures, torques, physics, None)
     """
     def compute_single(creature, motor_torques):
-        reward, com_dist, _ = physics_engine._compute_reward(
-            creature, motor_torques, goal_pos
-        )
+        # Per-creature goal (set by spawn_random_goal).  Falls back to the
+        # shared goal_pos for old code paths that haven't migrated yet.
+        g = (creature.goal_pos
+             if (hasattr(creature, 'goal_pos') and creature.goal_pos is not None)
+             else goal_pos)
+        reward, com_dist, _ = physics_engine._compute_reward(creature, motor_torques, g)
         return reward, com_dist
     
     # Submit all tasks to thread pool
@@ -330,10 +162,28 @@ class Environment:
         return torch.sqrt(dist_sq)
     
     def spawn_random_goal(self, env_id=0):
-        """Spawn a new goal at a random location on the map (in-place update)."""
+        """
+        Spawn a new goal for environment `env_id` only.
+
+        Per-creature goals fix the old bug where any env reaching its goal
+        would overwrite the single shared goal_pos_t for ALL environments,
+        giving every other env a new — wrong — target mid-episode.
+
+        Example:
+            # env 3 reaches goal → only its goal changes, others unaffected
+            self.spawn_random_goal(env_id=3)
+        """
         x = np.random.uniform(20, self.w - 20)
         y = np.random.uniform(20, self.h - 20)
         z = np.random.uniform(0, self.d - 5)
+        goal = torch.tensor([float(x), float(y), float(z)],
+                            device=self.device, dtype=self.dtype)
+
+        # Per-creature goal (independent per env)
+        if env_id < len(self.creatures):
+            self.creatures[env_id].goal_pos = goal.clone()
+
+        # Keep shared goal_pos_t in sync so the Renderer (env 0 view) is correct
         self.goal_pos_t[0] = float(x)
         self.goal_pos_t[1] = float(y)
         self.goal_pos_t[2] = float(z)
@@ -342,21 +192,28 @@ class Environment:
     
     def observe(self, creature):
         """
-        Observation for quadruped in AGENT-CENTERED WORLD (34D total).
-        See docs/QUADRUPED_BALANCE_TASK.md for component breakdown.
-        
+        Observation for quadruped in AGENT-CENTERED WORLD (34D).
+
+        Uses creature.goal_pos (per-creature goal) so two environments
+        can have different goals at the same time.  Falls back to the
+        shared self.goal_pos_t if goal_pos is not yet initialised.
+
         Returns: (1, 34) tensor
+            [joint_angles(12), joint_vels(12), foot_contact(4),
+             orientation(3), goal_relative(3)]
         """
-        from .entity import compute_center_of_mass
-        
+        goal = (
+            creature.goal_pos
+            if (hasattr(creature, 'goal_pos') and creature.goal_pos is not None)
+            else self.goal_pos_t
+        )
         obs_list = [
-            creature.joint_angles,                                    # (12,)
-            creature.joint_velocities,                                # (12,)
-            creature.foot_contact,                                    # (4,)
-            creature.orientation,                                     # (3,)
-            self.goal_pos_t - creature.pos                           # (3,) goal relative to agent
+            creature.joint_angles,      # (12,)
+            creature.joint_velocities,  # (12,)
+            creature.foot_contact,      # (4,)
+            creature.orientation,       # (3,)
+            goal - creature.pos,        # (3,) goal in agent-centred frame
         ]
-        
         obs = torch.cat(obs_list).unsqueeze(0).to(self.device)  # (1, 34)
         return obs
 
@@ -494,7 +351,6 @@ class TrainingEngine:
         self.model.eval()
         
         num_envs = self.env.num_envs
-        batch_size = num_envs
         
         # Initialize trajectory list for each environment
         trajectories = [[] for _ in range(num_envs)]
@@ -565,12 +421,10 @@ class TrainingEngine:
                     
                     # Track which actions would be clamped (for diagnostics)
                     actions_clamped = (torch.abs(actions) > 5.0).float()  # (batch, 12)
-                    clamp_fraction = actions_clamped.mean().item()  # Fraction of components exceeding [-5, 5]
                     
                     # Collect creatures and actions for parallel reward computation
                     active_creatures = []
                     active_actions = []
-                    active_rnn_states = []
                     active_env_ids = []
                     env_id_active = 0
                     
@@ -583,7 +437,6 @@ class TrainingEngine:
                             motor_torques = actions[env_id_active] # (12,)
                             active_creatures.append(creature)
                             active_actions.append(motor_torques)
-                            active_rnn_states.append(creature.rnn_state)
                             active_env_ids.append(env_id)
                             env_id_active += 1
                     
@@ -619,26 +472,25 @@ class TrainingEngine:
                                 # This is a CONTINUING task - the agent remembers across goals
                                 # Training will handle episode boundaries separately
                             
-                            # Get next value
-                            with torch.no_grad():
-                                next_obs = self.env.observe(creature)
-                                # RNN state carries forward to next goal for continuity
-                                (_, _), next_value, _ = self.model(
-                                    next_obs, edge_idx, prev_state=creature.rnn_state
-                                )
-                            
+                            # Store next_obs (cheap tensor cat, no model forward pass).
+                            # next_value will be computed by shifting value[t+1] after
+                            # the main loop, with one bootstrap call per env at the end.
+                            # This replaces steps × num_envs forward-pass calls with
+                            # num_envs calls total.
+                            next_obs = self.env.observe(creature)
+
                             # Store transition
                             trajectories[env_id].append({
                                 'obs': obs_list[env_id_active],
                                 'action': action_i,
                                 'reward': reward,
                                 'value': value_i.squeeze().detach(),
-                                'next_value': next_value.squeeze().detach(),
+                                'next_obs': next_obs,    # for world model training
                                 'done': float(done),
                                 'old_log_prob': log_prob_i.detach(),
                                 'joint_vels': creature.joint_velocities.detach().clone(),
                                 'foot_contacts': creature.foot_contact.detach().clone(),
-                                'action_clamped': actions_clamped[env_id_active],  # Track clamp per step
+                                'action_clamped': actions_clamped[env_id_active],
                             })
                             
                             step_counts[env_id] += 1
@@ -649,6 +501,30 @@ class TrainingEngine:
                     logger.warning(f"Batch processing failed: {e}, falling back to sequential")
                     return self.collect_trajectory_sequential(max_steps)
         
+        # --- Bootstrap next_values (one forward pass per env, not per step) ---
+        # next_value[t] = value[t+1] for t < T-1  (already in trajectory).
+        # For the last step we run one model forward pass to get the bootstrap.
+        #
+        # Old cost: steps × num_envs separate model calls inside the loop.
+        # New cost: num_envs model calls total, once at the end.
+        for env_id in range(num_envs):
+            traj = trajectories[env_id]
+            if not traj:
+                continue
+            # Shift: each step's next_value is the following step's value
+            for t in range(len(traj) - 1):
+                traj[t]['next_value'] = traj[t + 1]['value'].clone()
+            # Bootstrap last step (one call per env)
+            creature = self.env.creatures[env_id]
+            with torch.no_grad():
+                last_obs = self.env.observe(creature)
+                (_, _), bootstrap_val, _ = self.model(
+                    last_obs,
+                    self.env.edge_indices[0],
+                    prev_state=creature.rnn_state,
+                )
+            traj[-1]['next_value'] = bootstrap_val.squeeze().detach()
+
         # Wrap trajectories with metadata for batch training
         trajectories_wrapped = []
         for env_id, traj in enumerate(trajectories):
@@ -711,11 +587,6 @@ class TrainingEngine:
         # Spawn random goal within reachable distance
         self.env.spawn_random_goal(env_id)
         
-        # Store initial COM distance for tracking
-        from .entity import compute_center_of_mass
-        com_pos = compute_center_of_mass(creature.joint_angles, creature.orientation)
-        prev_com_dist = torch.norm(self.env.goal_pos_t[:2] - com_pos[:2])
-        
         while step_count < max_steps:
             # Get observation
             obs = self.env.observe(creature)
@@ -749,8 +620,6 @@ class TrainingEngine:
             done = float(com_dist) < self.physics.com_distance_threshold
             if done:
                 self.env.spawn_random_goal(env_id)
-                com_pos = compute_center_of_mass(creature.joint_angles, creature.orientation)
-                prev_com_dist = torch.norm(self.env.goal_pos_t[:2] - com_pos[:2])
                 # NOTE: creature.rnn_state intentionally NOT reset here
                 # This is a CONTINUING task - the agent remembers across goals
                 # Training will handle episode boundaries separately
@@ -826,27 +695,15 @@ class TrainingEngine:
         
         for _ in range(Config.PPO_EPOCHS):
             with torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
-                logits_list = []
-                value_list = []
-                
-                h0, c0 = self.model.init_state(1, self.device, self.dtype)
-                state = (h0.clone(), c0.clone())
-                
-                for t, obs in enumerate(obs_list):
-                    (mu, log_std), value, state = self.model(obs, self.env.edge_indices[0], prev_state=state)
-                    logits_list.append((mu, log_std))
-                    # During training: treat goal_reached (done) as episode boundary
-                    # Reset RNN state when done=1 (episodic training)
-                    value_list.append(value)
-                    
-                    h, c = state
-                    mask = (1.0 - dones[t]).view(1, 1)
-                    state = (h * mask, c * mask)
-                
-                mu_seq = torch.cat([m for m, _ in logits_list], dim=0)  # (T, 12)
-                log_std_seq = torch.cat([s for _, s in logits_list], dim=0)  # (T, 12)
-                value_seq = torch.cat(value_list, dim=0)
-                
+                # forward_sequence batches the encoder over all T observations at
+                # once instead of T separate (1, obs_dim) calls.
+                # Example T=1024, 4 epochs: was 4096 encoder calls → now 4.
+                # The LSTMCell unroll stays sequential for done-boundary masking.
+                obs_seq = torch.cat(obs_list, dim=0)    # (T, obs_dim)
+                (mu_seq, log_std_seq), value_seq, _ = self.model.forward_sequence(
+                    obs_seq, dones=dones
+                )
+
                 action_batch = torch.cat(action_list, dim=0)  # (T, 12)
                 std = torch.exp(log_std_seq)
                 
@@ -948,7 +805,6 @@ class TrainingEngine:
         all_old_log_probs = []
         all_obs = []
         all_actions = []
-        all_edge_indices = []
         all_joint_vels = []
         all_foot_contacts = []
         all_action_clamps = []
@@ -975,7 +831,6 @@ class TrainingEngine:
             all_old_log_probs.append(old_log_probs)
             all_obs.append(obs_list)
             all_actions.append(action_list)
-            all_edge_indices.append(edge_idx)
             all_joint_vels.append(joint_vels)
             all_foot_contacts.append(foot_contacts)
             all_action_clamps.append(action_clamps)
@@ -1008,31 +863,27 @@ class TrainingEngine:
         
         for epoch in range(Config.PPO_EPOCHS):
             with torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
-                logits_list = []
-                value_list = []
-                
-                step_idx = 0
-                for traj_idx, obs_list in enumerate(all_obs):
-                    h0, c0 = self.model.init_state(1, self.device, self.dtype)
-                    state = (h0.clone(), c0.clone())
-                    
-                    # Use edge_index stored with this trajectory, not global index
-                    edge_idx = all_edge_indices[traj_idx]
-                    
-                    for obs in obs_list:
-                        (mu, log_std), value, state = self.model(obs, edge_idx, prev_state=state)
-                        logits_list.append((mu, log_std))
-                        value_list.append(value)
-                        
-                        h, c = state
-                        mask = (1.0 - dones_batch[step_idx]).view(1, 1)
-                        state = (h * mask, c * mask)
-                        step_idx += 1
-                
-                mu_seq = torch.cat([m for m, _ in logits_list], dim=0)
-                log_std_seq = torch.cat([s for _, s in logits_list], dim=0)
-                value_seq = torch.cat(value_list, dim=0)
-                
+                # Batch encoder across all T steps per trajectory (one big matmul)
+                # instead of T × num_envs × PPO_EPOCHS separate (1, obs) calls.
+                # E.g. T=1024, 16 envs, 4 epochs: was 65 536 calls → now 64.
+                all_mus, all_log_stds, all_vals_epoch = [], [], []
+                step_offset = 0
+                for traj_idx, obs_list_t in enumerate(all_obs):
+                    T_traj  = len(obs_list_t)
+                    obs_seq = torch.cat(obs_list_t, dim=0)           # (T, obs_dim)
+                    t_dones = dones_batch[step_offset:step_offset + T_traj]
+                    (mu_t, log_std_t), val_t, _ = self.model.forward_sequence(
+                        obs_seq, dones=t_dones
+                    )
+                    all_mus.append(mu_t)
+                    all_log_stds.append(log_std_t)
+                    all_vals_epoch.append(val_t)
+                    step_offset += T_traj
+
+                mu_seq      = torch.cat(all_mus, dim=0)
+                log_std_seq = torch.cat(all_log_stds, dim=0)
+                value_seq   = torch.cat(all_vals_epoch, dim=0)
+
                 all_actions_flat = []
                 for action_list in all_actions:
                     all_actions_flat.extend(action_list)
@@ -1109,18 +960,22 @@ class TrainingEngine:
         num_batches = max(1, len(trajectory) // 32)
         
         for step in range(num_batches):
-            idx = torch.randint(0, len(trajectory) - 1, (32,))
+            idx = torch.randint(0, len(trajectory), (32,))
             
             batch_obs = []
             batch_actions = []
             batch_next_obs = []
             batch_rewards = []
             
-            # Convert tensor indices to Python ints for list indexing
             for i in idx.tolist():
                 batch_obs.append(trajectory[i]['obs'])
                 batch_actions.append(trajectory[i]['action'])
-                batch_next_obs.append(trajectory[i + 1]['obs'])
+                # Use stored next_obs (set during collection) so that done-boundary
+                # transitions are correctly represented.  Falls back to the next
+                # step's obs for legacy trajectories that pre-date this fix.
+                nxt = trajectory[i].get('next_obs',
+                                         trajectory[min(i + 1, len(trajectory) - 1)]['obs'])
+                batch_next_obs.append(nxt)
                 batch_rewards.append(trajectory[i]['reward'].unsqueeze(0))
             
             obs_batch = torch.cat(batch_obs, dim=0)

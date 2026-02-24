@@ -45,7 +45,7 @@ if __name__ == "__main__":
             
             for step in range(Config.MAX_STEPS_PER_EPISODE):
                 # Render
-                renderer.render(creature)
+                renderer.render()
                 
                 # Get observation
                 obs = app.env.observe(creature)

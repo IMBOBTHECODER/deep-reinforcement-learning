@@ -17,5 +17,4 @@ __all__ = [
     "Encoder",
     "init_single_creature",
     "System",
-    "HelperMath",
 ]

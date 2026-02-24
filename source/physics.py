@@ -31,8 +31,6 @@ def _get_optimal_thread_count():
     except:
         return 4
 
-PHYSICS_THREAD_POOL = None  # Lazy initialization
-
 
 @dataclass
 class Quaternion:
@@ -383,34 +381,57 @@ class PhysicsEngine:
             thread_name_prefix="physics_"
         ) if not HAS_CUDA else None
         
-        # RIGID BODY: Torso with full dynamics (mass, inertia, orientation)
-        m = Config.BODY_MASS
-        a, b, c = Config.BODY_DIMENSIONS
-        I_diag = np.array([
-            (1/12) * m * (b*b + c*c),  # I_xx
-            (1/12) * m * (a*a + c*c),  # I_yy
-            (1/12) * m * (a*a + b*b)   # I_zz
-        ])
-        I_tensor = np.diag(I_diag)
-        
-        self.body = RigidBody(
-            pos=np.array([0.0, 0.0, Config.BODY_INITIAL_HEIGHT]),
-            orientation=Quaternion.identity(),
-            linear_vel=np.zeros(3),
-            angular_vel=np.zeros(3),
-            mass=m,
-            inertia_tensor=I_tensor
-        )
-        
+        # Per-creature rigid bodies.
+        # Previously a single self.body was shared across all parallel environments,
+        # causing two bugs:
+        #   1. Race condition: threads in ThreadPoolExecutor overwrote each other's
+        #      body state, serialising what should be parallel work.
+        #   2. Wrong physics: env A's creature.pos was overwritten by env B's body.
+        # Bodies are now created lazily per creature in _get_or_create_body().
+        self._bodies = {}
+
         self.agent_local_pos = torch.zeros(3, device=device, dtype=dtype)
         self.atanh_eps = Config.ATANH_EPSILON
         self.log_eps = Config.LOG_EPSILON
-        
-        # ===== JOINT CONSTRAINTS (Optional, Phase 5): Realistic joint limits and damping =====
-        # Dictionary: creature_id -> [JointConstraint objects]
-        self.joint_constraints = {}  
+
+        # ===== JOINT CONSTRAINTS (Optional, Phase 5) =====
+        self.joint_constraints = {}
         self.use_joint_constraints = getattr(Config, 'USE_JOINT_CONSTRAINTS', False)
-    
+
+    def _get_or_create_body(self, creature) -> RigidBody:
+        """
+        Return the RigidBody for this creature, creating it on first access.
+
+        Each parallel environment (creature) owns its own RigidBody.
+        Bodies are keyed by Python object id so there is zero shared state
+        between environments, making ThreadPoolExecutor physics safe.
+
+        Example:
+            body = self._get_or_create_body(creature)  # own body, no races
+            body.add_force(gravity)                     # affects only this env
+        """
+        cid = id(creature)
+        if cid not in self._bodies:
+            from config import Config
+            m   = Config.BODY_MASS
+            a, b, c_dim = Config.BODY_DIMENSIONS
+            I_diag = np.array([
+                (1/12) * m * (b * b + c_dim * c_dim),
+                (1/12) * m * (a * a + c_dim * c_dim),
+                (1/12) * m * (a * a + b * b),
+            ])
+            self._bodies[cid] = RigidBody(
+                pos=np.array([float(creature.pos[0]),
+                               float(creature.pos[1]),
+                               float(creature.pos[2])]),
+                orientation=Quaternion.identity(),
+                linear_vel=np.zeros(3),
+                angular_vel=np.zeros(3),
+                mass=m,
+                inertia_tensor=np.diag(I_diag),
+            )
+        return self._bodies[cid]
+
     def apply_motor_torques(self, creature, motor_torques):
         """
         Apply motor torques and integrate rigid body dynamics (quaternion-based orientation, Euler equations).
@@ -449,191 +470,128 @@ class PhysicsEngine:
             # Use lagged torques for physics
             motor_torques = creature._actuator_state.clone()
         
-        # ===== GPU-ACCELERATED JOINT UPDATE (always enabled if CUDA available) =====
-        if HAS_CUDA and self.device.type == 'cuda':
-            try:
-                # Convert to GPU arrays for Numba CUDA kernel (zero-copy if already on GPU)
-                angles_gpu = cuda.as_cuda_array(creature.joint_angles)
-                vels_gpu = cuda.as_cuda_array(creature.joint_velocities)
-                torques_gpu = cuda.as_cuda_array(motor_torques.squeeze() if motor_torques.dim() > 1 else motor_torques)
-                
-                # Maximize GPU utilization: 1024 threads per block for modern GPUs
-                # For N joints: blocks = ceil(N / 1024) → good occupancy even with small batches
-                threadsperblock = Config.GPU_THREADS_PER_BLOCK
-                blockspergrid = (angles_gpu.size + threadsperblock - 1) // threadsperblock
-                
-                # Clamp blocks to prevent timeout on large batches (optional safeguard)
-                if blockspergrid > Config.GPU_MAX_BLOCKS:
-                    blockspergrid = Config.GPU_MAX_BLOCKS
-                
-                # Launch GPU kernel with optimized thread layout
-                update_joint_dynamics_gpu[blockspergrid, threadsperblock](
-                    angles_gpu, vels_gpu, torques_gpu,
-                    self.joint_damping, self.max_joint_velocity, math.pi, self.dt
-                )
-                # Complete rigid body physics on CPU after GPU joint update
-                return self._update_joint_dynamics_cpu(creature, motor_torques)
-            except Exception as e:
-                # Fallback to CPU if GPU fails (device error, memory, or timeout)
-                print(f"[Physics] GPU kernel failed, falling back to CPU: {e}")
-                return self._update_joint_dynamics_cpu(creature, motor_torques)
-        else:
-            # CPU path (CUDA not available)
-            return self._update_joint_dynamics_cpu(creature, motor_torques)
+        # Joint dynamics run on CPU via PyTorch matmuls.
+        # WHY NOT CUDA here: launching any CUDA kernel costs ~10-30 µs of
+        # overhead.  For 12 joint values that is more than the actual math.
+        # Worse, the old kernel ran joint updates TWICE (GPU then CPU again),
+        # wasting work.  Batched GPU kernels are still used in step_batch()
+        # for the 1000+ environment case where launch overhead amortises.
+        return self._update_joint_dynamics_cpu(creature, motor_torques)
     
     def _update_joint_dynamics_cpu(self, creature, motor_torques):
-        """CPU fallback for joint updates (pure PyTorch)."""
+        """
+        Joint dynamics + contact physics for one creature (CPU PyTorch).
+
+        Per-creature RigidBody: each environment gets its own body via
+        _get_or_create_body().  The old shared self.body caused race
+        conditions in ThreadPoolExecutor and wrong physics (one env's
+        step overwrote another env's rigid-body state).
+        """
+        # Fetch (or lazily create) this creature's dedicated rigid body.
+        body = self._get_or_create_body(creature)
+
+        # ---- 1. Joint velocity + angle integration ----
         creature.joint_velocities.copy_(
             creature.joint_velocities + (motor_torques.squeeze() - self.joint_damping * creature.joint_velocities) * self.dt
         )
-        
         creature.joint_velocities.copy_(torch.clamp(creature.joint_velocities, -self.max_joint_velocity, self.max_joint_velocity))
-        
         creature.joint_angles.copy_(creature.joint_angles + creature.joint_velocities * self.dt)
         creature.joint_angles.copy_(torch.clamp(creature.joint_angles, -math.pi, math.pi))
-        
-        # Compute foot positions via forward kinematics
+
+        # ---- 2. Forward kinematics → foot positions ----
         from .entity import compute_foot_positions
-        
         foot_positions = compute_foot_positions(creature.joint_angles, creature.orientation, self.segment_length)
-        
-        # Note: Agent COM is creature.pos (rigid body center of mass)
-        # Kinematic COM from joint forward kinematics is not used for reward/control
-        # (creature.pos is the actual integrated body position from physics)
-        
-        # ADVANCED: Detect contacts and apply forces to rigid body
+
+        # ---- 3. Contact detection + spring-damper forces ----
         num_contacts = 0
         contact_force_total = np.zeros(3)
-        contact_vel_restitution = 0.0  # Track for restitution
-        energy_consumed = 0.0  # Phase 4: Track energy
-        
+        energy_consumed = 0.0
+
         for foot_idx in range(4):
             foot_z = float(foot_positions[foot_idx, 2])
-            
             if foot_z <= self.ground_level + self.foot_height_threshold:
                 num_contacts += 1
                 creature.foot_contact[foot_idx] = 1.0
-                
-                # ===== Spring-damper contact model with restitution =====
                 penetration = max(0, self.ground_level - foot_z)
                 contact_normal_force = self.contact_stiffness * penetration
-                
-                # Damping component (dissipates energy on impact)
-                contact_damper_force = self.contact_damping * float(self.body.linear_vel[2])
-                
-                # Restitution component (Phase 3: bouncing)
-                # e * (-v_rel) where e is coefficient of restitution
-                # If foot velocity is downward (negative z_vel), restitution creates upward force
-                restitution_force = self.contact_restitution * (-float(self.body.linear_vel[2])) * (self.contact_stiffness * penetration / max(penetration, 0.001))
-                
-                # Unilateral contact: force cannot pull (no adhesion)
+                # Damping: resists downward body velocity
+                contact_damper_force = self.contact_damping * float(body.linear_vel[2])
+                # Restitution: small bounce on impact
+                restitution_force = self.contact_restitution * (-float(body.linear_vel[2])) * (
+                    self.contact_stiffness * penetration / max(penetration, 0.001)
+                )
                 contact_force_z = max(0.0, contact_normal_force - contact_damper_force + restitution_force)
                 contact_force_total[2] += contact_force_z
-                contact_vel_restitution = float(self.body.linear_vel[2])
             else:
                 creature.foot_contact[foot_idx] = 0.0
-        
-        # ===== Phase 2: Improved Friction Model =====
-        # Compute friction forces based on contact normal force and foot slip velocity
+
+        # ---- 4. Friction model ----
         if num_contacts > 0 and contact_force_total[2] > 0:
-            normal_force = contact_force_total[2]  # Average normal force per foot
-            
-            # Foot horizontal velocity (slip velocity)
-            foot_vel_horizontal = np.sqrt(self.body.linear_vel[0]**2 + self.body.linear_vel[1]**2)
-            
+            normal_force = contact_force_total[2]
+            foot_vel_horizontal = np.sqrt(body.linear_vel[0]**2 + body.linear_vel[1]**2)
+
             if self.friction_model == "coulomb+viscous":
-                # Compute friction: μ*N + η*v_slip
-                friction_force = self._compute_friction_force_coulomb_viscous(
-                    normal_force, foot_vel_horizontal
-                )
+                friction_force = self._compute_friction_force_coulomb_viscous(normal_force, foot_vel_horizontal)
             elif self.friction_model == "coulomb":
-                # Simple Coulomb: F = μ*N
                 friction_force = self.friction_coeff_kinetic * normal_force
-            else:  # "simple" or legacy
+            else:
                 friction_force = self.friction_coeff * normal_force if hasattr(self, 'friction_coeff') else 0.0
-            
-            # ===== Phase 3: Friction Cones (Directional Constraint) =====
+
             if self.use_friction_cones and foot_vel_horizontal > self.friction_slip_threshold:
-                # Friction cone: ||F_tangent|| <= mu * F_normal
-                # Direct from Coulomb law: prevent sliding beyond cone
                 friction_force = min(friction_force, self.friction_coeff_kinetic * normal_force)
-                
-                # Apply friction in direction opposite to velocity
-                direction = np.array([self.body.linear_vel[0], self.body.linear_vel[1], 0.0]) / (foot_vel_horizontal + 1e-8)
+                direction = np.array([body.linear_vel[0], body.linear_vel[1], 0.0]) / (foot_vel_horizontal + 1e-8)
                 friction_vector = -friction_force * direction / num_contacts
-                
-                # Add damping within cone for stability
-                damping_vector = -self.friction_cone_damping * np.array([self.body.linear_vel[0], self.body.linear_vel[1], 0.0]) / num_contacts
+                damping_vector = -self.friction_cone_damping * np.array([body.linear_vel[0], body.linear_vel[1], 0.0]) / num_contacts
                 contact_force_total[:2] += friction_vector[:2] + damping_vector[:2]
             elif foot_vel_horizontal > self.friction_slip_threshold:
-                # Without friction cones (legacy)
-                direction = np.array([self.body.linear_vel[0], self.body.linear_vel[1], 0.0]) / (foot_vel_horizontal + 1e-8)
+                direction = np.array([body.linear_vel[0], body.linear_vel[1], 0.0]) / (foot_vel_horizontal + 1e-8)
                 friction_vector = -friction_force * direction / num_contacts
                 contact_force_total[:2] += friction_vector[:2]
-        
-        # Normalize contact force by contacting feet
+
         if num_contacts > 0:
             contact_force_total[2] /= num_contacts
-        
-        # ===== Phase 4: Energy Tracking =====
+
+        # ---- 5. Energy tracking (Phase 4) ----
         if self.track_energy:
-            # Mechanical power = torque × angular velocity
-            # Total power = sum of |τ_i * ω_i| for all joints
-            torques_squeezed = motor_torques.squeeze() if motor_torques.dim() > 1 else motor_torques
-            vels = creature.joint_velocities.squeeze() if creature.joint_velocities.dim() > 1 else creature.joint_velocities
-            
-            mechanical_power = torch.sum(torch.abs(torques_squeezed * vels)).item()
-            # Electrical power = mechanical_power / efficiency
-            electrical_power = mechanical_power / max(self.motor_efficiency, 0.01)
-            energy_consumed = electrical_power * self.dt
-            
-            # Track cumulative energy
+            torques_sq = motor_torques.squeeze() if motor_torques.dim() > 1 else motor_torques
+            vels_sq    = creature.joint_velocities.squeeze() if creature.joint_velocities.dim() > 1 else creature.joint_velocities
+            mechanical_power  = torch.sum(torch.abs(torques_sq * vels_sq)).item()
+            electrical_power  = mechanical_power / max(self.motor_efficiency, 0.01)
+            energy_consumed   = electrical_power * self.dt
             if not hasattr(creature, '_total_energy_consumed'):
                 creature._total_energy_consumed = 0.0
             creature._total_energy_consumed += energy_consumed
-        
-        # Apply forces to rigid body (contact-dependent gravity)
+
+        # ---- 6. Apply forces + integrate rigid body ----
         gravity_factor = 1.0 - min(num_contacts, 4) / 4.0
-        self.body.add_force(np.array([0, 0, -self.gravity * self.body.mass * gravity_factor]))
-        self.body.add_force(contact_force_total)
-        
-        # Integrate rigid body dynamics
-        self.body.integrate(self.dt, gravity=0)
-        
-        # ===== Phase 5: Joint Constraints (Optional) =====
-        # Apply joint constraints to enforce realistic limits and damping
+        body.add_force(np.array([0, 0, -self.gravity * body.mass * gravity_factor]))
+        body.add_force(contact_force_total)
+        body.integrate(self.dt, gravity=0)
+
+        # ---- 7. Joint constraints (Phase 5, optional) ----
         if self.use_joint_constraints and id(creature) in self.joint_constraints:
-            creature_id = id(creature)
-            for joint in self.joint_constraints[creature_id]:
-                # Joint constraints apply forces/torques relative to body positions
-                # This enforce limits and damping on top of motor torques
-                joint.apply_constraint(self.body, None, self.dt)
-        
-        # Sync creature position with body COM (in-place update to preserve tensor references)
-        creature.pos.copy_(torch.as_tensor(self.body.pos, device=self.device, dtype=self.dtype))
-        
-        # Update orientation from quaternion (element-wise, preserving tensor reference)
-        pitch, yaw, roll = self.body.orientation.to_euler()
+            for joint in self.joint_constraints[id(creature)]:
+                joint.apply_constraint(body, None, self.dt)
+
+        # ---- 8. Sync creature tensors from rigid body (in-place) ----
+        creature.pos.copy_(torch.as_tensor(body.pos, device=self.device, dtype=self.dtype))
+        pitch, yaw, roll = body.orientation.to_euler()
         creature.orientation[0] = float(pitch)
         creature.orientation[1] = float(yaw)
         creature.orientation[2] = float(roll)
-        
-        # Sync linear and angular velocity (in-place update to preserve tensor references)
-        creature.velocity.copy_(torch.as_tensor(self.body.linear_vel, device=self.device, dtype=self.dtype))
-        
-        # Stability metrics
+        creature.velocity.copy_(torch.as_tensor(body.linear_vel, device=self.device, dtype=self.dtype))
+
         stability_metrics = {
-            'foot_positions': foot_positions,
-            'com_pos': creature.pos,
-            'num_contacts': num_contacts,
-            'pitch': creature.orientation[0],
-            'roll': creature.orientation[2],
-            'angular_vel': torch.tensor(self.body.angular_vel, device=self.device, dtype=self.dtype),
-            'energy_consumed': energy_consumed,  # Phase 4: Include in metrics
+            'foot_positions' : foot_positions,
+            'com_pos'        : creature.pos,
+            'num_contacts'   : num_contacts,
+            'pitch'          : creature.orientation[0],
+            'roll'           : creature.orientation[2],
+            'angular_vel'    : torch.tensor(body.angular_vel, device=self.device, dtype=self.dtype),
+            'energy_consumed': energy_consumed,
         }
-        
         return creature.pos, stability_metrics
-    
+
     def _compute_friction_force_coulomb_viscous(self, normal_force: float, slip_velocity: float) -> float:
         """
         PHASE 2: Compute friction force using Coulomb + viscous damping model.
@@ -821,10 +779,6 @@ class PhysicsEngine:
         """
         num_envs = len(creatures_batch)
         
-        # Extract batched state from creatures
-        positions_batch = torch.stack([c.pos for c in creatures_batch])  # (num_envs, 3)
-        velocities_batch = torch.stack([c.velocity for c in creatures_batch])  # (num_envs, 3)
-        
         # Clamp motor torques
         motor_torques_batch = torch.clamp(motor_torques_batch, -self.max_torque, self.max_torque)
         
@@ -844,18 +798,20 @@ class PhysicsEngine:
         distances_batch = []
         
         for i, creature in enumerate(creatures_batch):
-            # Joint updates (GPU accelerated if CUDA available)
+            # Get this creature's own RigidBody (fixes the shared self.body race condition)
+            body = self._get_or_create_body(creature)
+
+            # Joint updates
             creature.joint_velocities.copy_(
                 creature.joint_velocities + (motor_torques_batch[i].squeeze() - self.joint_damping * creature.joint_velocities) * self.dt
             )
             creature.joint_velocities.copy_(torch.clamp(creature.joint_velocities, -self.max_joint_velocity, self.max_joint_velocity))
             creature.joint_angles.copy_(creature.joint_angles + creature.joint_velocities * self.dt)
             creature.joint_angles.copy_(torch.clamp(creature.joint_angles, -math.pi, math.pi))
-            
-            # Compute reward for this environment
+
             from .entity import compute_foot_positions
             foot_positions = compute_foot_positions(creature.joint_angles, creature.orientation, self.segment_length)
-            
+
             # Contact detection
             num_contacts = 0
             contact_force_z = 0.0
@@ -864,22 +820,24 @@ class PhysicsEngine:
                 if foot_z <= self.ground_level + self.foot_height_threshold:
                     num_contacts += 1
                     penetration = max(0, self.ground_level - foot_z)
-                    spring = self.contact_stiffness * penetration
-                    damper = self.contact_damping * float(self.body.linear_vel[2])
-                    restitution = self.contact_restitution * (-float(self.body.linear_vel[2])) * (self.contact_stiffness * penetration / max(penetration, 0.001))
+                    spring       = self.contact_stiffness * penetration
+                    damper       = self.contact_damping * float(body.linear_vel[2])
+                    restitution  = self.contact_restitution * (-float(body.linear_vel[2])) * (
+                        self.contact_stiffness * penetration / max(penetration, 0.001)
+                    )
                     contact_force_z += max(0.0, spring - damper + restitution)
-            
+
             if num_contacts > 0:
                 contact_force_z /= num_contacts
-            
-            # Apply forces and integrate body
+
+            # Apply forces and integrate
             gravity_factor = 1.0 - min(num_contacts, 4) / 4.0
-            self.body.add_force(np.array([0, 0, -self.gravity * self.body.mass * gravity_factor]))
-            self.body.add_force(np.array([0, 0, contact_force_z]))
-            self.body.integrate(self.dt, gravity=0)
-            
-            creature.pos.copy_(torch.as_tensor(self.body.pos, device=self.device, dtype=self.dtype))
-            pitch, yaw, roll = self.body.orientation.to_euler()
+            body.add_force(np.array([0, 0, -self.gravity * body.mass * gravity_factor]))
+            body.add_force(np.array([0, 0, contact_force_z]))
+            body.integrate(self.dt, gravity=0)
+
+            creature.pos.copy_(torch.as_tensor(body.pos, device=self.device, dtype=self.dtype))
+            pitch, yaw, roll = body.orientation.to_euler()
             creature.orientation[0] = float(pitch)
             creature.orientation[1] = float(yaw)
             creature.orientation[2] = float(roll)

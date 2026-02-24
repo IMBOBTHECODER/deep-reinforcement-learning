@@ -179,6 +179,12 @@ class Creature:
     leg_length: float = 0.3  # Total leg length (3 segments of 0.1 each)
     segment_length: float = 0.1  # Length of each joint segment
 
+    # Per-creature goal position.
+    # Each environment gets its own independent goal so that one env reaching
+    # its goal does not overwrite the goal for all other envs (the old shared
+    # goal_pos_t bug).  Set by Environment.spawn_random_goal(env_id).
+    goal_pos: Optional[torch.Tensor] = None  # (3,) world-space goal
+
 
 class Encoder(nn.Module):
     """PATTERN A: Shared encoder trained ONLY by Dreamer on replay buffer.
@@ -316,6 +322,78 @@ class EntityBelief(nn.Module):
 
         return (mu, log_std), v, (h_t, c_t)
 
+    def forward_sequence(
+        self,
+        obs_seq: torch.Tensor,                    # (T, obs_dim)
+        dones: torch.Tensor = None,               # (T,) float, 1.0 = episode ended
+        prev_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        """
+        Process a full trajectory for PPO training.
+
+        KEY SPEEDUP over calling forward() T times:
+          The encoder (34 → 128) and all linear heads run as a SINGLE batched
+          matmul over (T, *) instead of T separate (1, *) matmuls.
+          Only the LSTMCell loop stays sequential (needed for done-masking).
+
+          Example – T=1024 steps, 4 PPO epochs, 16 envs:
+            Before: 4 × 16 × 1024 = 65 536 separate encoder forward passes.
+            After:  4 × 16 = 64 encoder forward passes over batches of 1024.
+
+        Args:
+            obs_seq  : (T, obs_dim) stacked observations for one trajectory.
+            dones    : (T,) float tensor.  Where dones[t] == 1.0 the LSTM
+                       hidden state is zeroed out (episode boundary).
+            prev_state: initial (h, c), each (1, H).  None → zeros.
+
+        Returns:
+            (mu_seq, log_std_seq): each (T, num_actions)
+            values              : (T,)
+            (h_final, c_final)  : LSTM state after the last step
+        """
+        T = obs_seq.size(0)
+        device, dtype = obs_seq.device, obs_seq.dtype
+
+        # ------------------------------------------------------------------
+        # 1. Encode ALL observations at once  →  ONE big matmul instead of T
+        # ------------------------------------------------------------------
+        with torch.no_grad():                        # encoder is frozen for PPO
+            features = self.encoder(obs_seq)         # (T, embed_dim)
+
+        # ------------------------------------------------------------------
+        # 2. Project features to LSTM input dim  →  still one matmul
+        # ------------------------------------------------------------------
+        g_seq = self.policy.feature_projection(features)  # (T, lstm_hidden)
+
+        # ------------------------------------------------------------------
+        # 3. Unroll LSTMCell with done-boundary masking (must be sequential)
+        # ------------------------------------------------------------------
+        if prev_state is None:
+            prev_state = self.init_state(1, device, dtype)
+        h, c = prev_state
+
+        h_list = []
+        for t in range(T):
+            h, c = self.policy.lstm(g_seq[t:t+1], (h, c))
+            h_list.append(h)
+            # Zero LSTM state when an episode ends so the next episode starts
+            # fresh (identical behaviour to the per-step masking in the old loop).
+            if dones is not None and dones[t] > 0.5:
+                h = h * 0.0
+                c = c * 0.0
+
+        h_seq = torch.cat(h_list, dim=0)  # (T, lstm_hidden)
+
+        # ------------------------------------------------------------------
+        # 4. Policy + value heads  →  one matmul each over (T, lstm_hidden)
+        # ------------------------------------------------------------------
+        mu_seq      = self.policy.policy_mu(h_seq)                    # (T, A)
+        log_std_seq = self.policy.log_std_param.expand_as(mu_seq)     # (T, A)
+        log_std_seq = torch.clamp(log_std_seq, -5, 2)
+        values      = self.policy.value(h_seq).squeeze(-1)            # (T,)
+
+        return (mu_seq, log_std_seq), values, (h, c)
+
 
 def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0), device=None):
     """
@@ -376,10 +454,12 @@ def init_single_creature(model, en_id=0, pos=(0.0, 0.0, 0.0), orientation=(0.0, 
         velocity=vel_t,
         orientation=ori_t,
         rnn_state=(h0, c0),
-
         joint_angles=joint_angles,
         joint_velocities=joint_velocities,
         foot_contact=foot_contact,
+        # goal_pos is initialised to zeros here and will be overwritten by
+        # Environment.spawn_random_goal() before the first episode step.
+        goal_pos=torch.zeros(3, dtype=dtype, device=device),
     )
 
     # Graph structure: Currently a single-node self-loop (efficiency optimization)

@@ -9,7 +9,7 @@ class Config:
     # Core training parameters
     DIM = (64, 32, 64)  # World dimensions (larger for balance task)
     MAX_STEPS_PER_EPISODE = 1024
-    MAX_TRAINING_EPISODES = 128
+    MAX_TRAINING_EPISODES = 64
     LOAD_CHECKPOINT = False
     CHECKPOINT_DIR = Path("checkpoint")
     
@@ -21,8 +21,6 @@ class Config:
     MAX_DATA_THRESHOLD_MB = 8192
     
     # Memory model updated for quadruped observation (34D)
-    # Observation: (1, 34) float32 = 136 bytes per observation
-    OBS_BYTES = 136  # (1, 34) float32 quadruped observation
     PER_STEP_BYTES = 280  # obs + action(12) + logprob + value + reward + done + buffers
     ROLLOUT_STEPS = 256
     MEMORY_OVERHEAD_MB = 256
@@ -63,14 +61,11 @@ class Config:
     # ============ MULTI-CORE PROCESSING ============
     # Always enabled: CPU threads handle physics when GPU not available
     NUM_PHYSICS_THREADS = None  # None = auto-detect (typically num_cpus - 1)
-    PHYSICS_BATCH_SIZE = 4  # Physics steps batched together per thread
     
     # ============ GPU ACCELERATION & VECTORIZATION (Numba CUDA) ============
     # Phase 4b: GPU-accelerated vectorized physics for 1000+ environments
     GPU_THREADS_PER_BLOCK = 1024  # Threads per block (1024 for RTX cards, 512 for older)
-    GPU_MAX_BLOCKS = 32  # Maximum thread blocks for occupancy
     VECTORIZED_PHYSICS = True  # Enable batched physics kernel (1000+ envs on GPU)
-    VECTORIZED_BATCH_SIZE = 1024  # Batch size for GPU physics (environments per kernel call)
     
     # ============ BALANCE TASK REWARD SHAPING ============
     # Goal: Keep center of mass (COM) close to goal position
@@ -79,13 +74,6 @@ class Config:
     ENERGY_PENALTY = 0.01  # Penalty for high motor torques
     TILT_PENALTY = 0.5  # Penalty for tilting beyond MAX_PITCH_ROLL
     COM_DISTANCE_THRESHOLD = 0.3  # Reference distance (for documentation)
-    
-    # Legacy params (kept for compatibility, not used in balance task)
-    GOAL_DISTANCE_THRESHOLD = 0.3
-    PROXIMITY_THRESHOLD = 10.0
-    PROXIMITY_BONUS_SCALE = 0.1
-    GOAL_BONUS = 10.0
-    DISTANCE_REWARD_SCALE = 0.5
     
     
     # ============ PHYSICS SYSTEM - QUADRUPED ============
@@ -147,8 +135,6 @@ class Config:
     WORLD_MODEL_HIDDEN_DIM = 256
     WORLD_MODEL_LR = 1e-3
     WORLD_MODEL_WEIGHT_DECAY = 1e-6
-    IMAGINATION_HORIZON = 15
-    WORLD_MODEL_LOSS_SCALE = 1.0
 
     @classmethod
     def auto_num_envs(cls, available_memory_mb=None):

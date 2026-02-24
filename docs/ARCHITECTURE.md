@@ -2,6 +2,137 @@
 
 Comprehensive guide to the system's architecture, components, and data flow for the quadruped balance task.
 
+---
+
+## Bug Fixes & Performance Improvements (Feb 2026)
+
+Six critical bugs were found and fixed after profiling showed 4–5 min/episode on a T4 GPU,
+with the CPU pegged at 100 % and the GPU mostly idle.
+
+---
+
+### Fix 1 — Shared `self.body` (correctness + threading)
+
+**Problem.** `PhysicsEngine` had a single `self.body = RigidBody(...)`.  
+All environments shared it, so:
+- `ThreadPoolExecutor` workers overwrote each other's physics state (race condition).
+- Creature A's position was set from Creature B's rigid-body integration.
+
+**Fix.** `self._bodies = {}` dict, keyed by `id(creature)`.  
+Each environment gets its own `RigidBody`, created lazily on first access.
+
+```python
+# physics.py
+body = self._get_or_create_body(creature)   # safe — this env only
+body.add_force(gravity)
+body.integrate(dt)
+```
+
+---
+
+### Fix 2 — Shared `goal_pos_t` overwrote every env's goal
+
+**Problem.** `spawn_random_goal(env_id)` wrote to a single `self.goal_pos_t` tensor.  
+When env 3 reached its goal, the goal for ALL environments changed mid-episode.
+
+**Fix.** Each `Creature` now carries its own `goal_pos` tensor (set by `spawn_random_goal`).  
+`observe()` reads `creature.goal_pos` instead of the shared tensor.
+
+```python
+# env 3 reaches goal → only env 3 gets a new goal
+self.spawn_random_goal(env_id=3)
+# env 0, 1, 2 keep their old goals untouched ✓
+```
+
+---
+
+### Fix 3 — Double forward pass in collection loop (2× inference waste)
+
+**Problem.** After every step the code ran a full model forward pass just to get `next_value`:
+
+```python
+# OLD — called steps × num_envs times (e.g. 1024 × 16 = 16 384 extra calls/episode)
+(_, _), next_value, _ = self.model(next_obs, ...)
+```
+
+**Fix.** Remove the in-loop call. After collection, shift `value[t+1] → next_value[t]`
+and run **one** bootstrap call per environment for the final step:
+
+```python
+# NEW — num_envs calls total (e.g. 16 instead of 16 384)
+for t in range(T - 1):
+    traj[t]['next_value'] = traj[t + 1]['value']
+traj[-1]['next_value'] = bootstrap_val   # one final call per env
+```
+
+---
+
+### Fix 4 — Sequential per-step encoder in PPO training (10–50× compute waste)
+
+**Problem.** The PPO epoch loop ran the model one timestep at a time:
+
+```python
+# OLD — T × num_envs × PPO_EPOCHS encoder calls, each (1, 34):
+for obs in obs_list:                       # 1024 iterations
+    (mu, log_std), value, state = model(obs, ...)
+```
+
+The encoder `(1, 34) → (1, 128)` is a tiny isolated matmul with GPU kernel-launch
+overhead on every call.
+
+**Fix.** `EntityBelief.forward_sequence(obs_seq, dones)` batches the encoder:
+
+```python
+# NEW — 1 encoder call over (T, 34), then LSTMCell loop for masking
+obs_seq = torch.cat(obs_list, dim=0)          # (T, 34)
+(mu_seq, log_std_seq), value_seq, _ = model.forward_sequence(obs_seq, dones=dones)
+```
+
+| | Before | After |
+|---|---|---|
+| Encoder calls per episode | T × envs × epochs = 65 536 | envs × epochs = 64 |
+| Each call shape | (1, 34) | (1024, 34) |
+
+---
+
+### Fix 5 — Counterproductive CUDA joint kernel
+
+**Problem.** `apply_motor_torques` launched a Numba CUDA kernel to update 12 joint values.  
+One CUDA block with 1024 threads was launched — meaning **1012 threads sat idle**.  
+Kernel-launch overhead (~10–30 µs) exceeded the actual computation time.  
+Worse, the GPU then called `_update_joint_dynamics_cpu` anyway, running the joint update **twice**.
+
+**Fix.** Remove the CUDA dispatch for single-creature joint updates.  
+PyTorch CPU matmuls are faster for 12 values.  
+The batched CUDA kernels in `step_batch()` (1000+ environments) are kept and correct.
+
+```python
+# REMOVED: 1-block × 1024-thread GPU kernel for 12 joints
+# NOW: direct CPU call — cheaper, correct, no double-update
+return self._update_joint_dynamics_cpu(creature, motor_torques)
+```
+
+---
+
+### Fix 6 — World model trained across episode boundaries
+
+**Problem.** `train_world_model` used `trajectory[i+1]['obs']` as `next_obs`.  
+When step `i` was a goal-reached boundary, `trajectory[i+1]` was the first obs of the
+**next episode**, making the model learn a false dynamics transition.
+
+**Fix.** `next_obs` is now stored in the trajectory dict right after the physics step
+(correct, within the same continuous step), and `train_world_model` reads it directly:
+
+```python
+# collection: next_obs captured immediately after physics update
+traj.append({'obs': obs, 'next_obs': self.env.observe(creature), ...})
+
+# training: use stored next_obs (no done-boundary mix-up)
+nxt = trajectory[i].get('next_obs', trajectory[i+1]['obs'])
+```
+
+---
+
 ## System Overview (Updated Feb 2026)
 
 ### Latest: Vectorized GPU Physics (250 Hz + Batching)
