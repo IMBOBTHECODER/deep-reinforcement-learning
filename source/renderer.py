@@ -1,6 +1,5 @@
 import math
 import pyray as pr
-import torch
 import logging
 
 from config import Config

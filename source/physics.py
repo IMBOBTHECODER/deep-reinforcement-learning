@@ -384,14 +384,28 @@ class PhysicsEngine:
             thread_name_prefix="physics_"
         ) if not HAS_CUDA else None
         
-        # Per-creature rigid bodies.
-        # Previously a single self.body was shared across all parallel environments,
-        # causing two bugs:
-        #   1. Race condition: threads in ThreadPoolExecutor overwrote each other's
-        #      body state, serialising what should be parallel work.
-        #   2. Wrong physics: env A's creature.pos was overwritten by env B's body.
-        # Bodies are now created lazily per creature in _get_or_create_body().
+        # Per-creature rigid bodies (CPU/NumPy path – used by sequential fallback).
         self._bodies = {}
+
+        # ── Batched GPU body state for _step_batch_gpu ───────────────────────
+        # Persistent (max_envs, D) tensors on GPU replace per-creature NumPy
+        # RigidBody objects, eliminating CPU↔GPU round-trips each physics step.
+        self._body_slots: dict = {}     # id(creature) → int slot
+        self._next_slot: int = 0
+        self._bp:  torch.Tensor = None  # (max_envs, 3) positions
+        self._blv: torch.Tensor = None  # (max_envs, 3) linear velocities
+        self._bav: torch.Tensor = None  # (max_envs, 3) angular velocities
+        self._bq:  torch.Tensor = None  # (max_envs, 4) quaternions [w, x, y, z]
+        # Body constants reused each step (avoid Config lookups in hot path)
+        _m = Config.BODY_MASS
+        _a, _b, _c = Config.BODY_DIMENSIONS
+        self._body_mass = float(_m)
+        self.max_angular_velocity = float(Config.MAX_ANGULAR_VELOCITY)
+        self._I_diag = torch.tensor([
+            (1/12) * _m * (_b*_b + _c*_c),
+            (1/12) * _m * (_a*_a + _c*_c),
+            (1/12) * _m * (_a*_a + _b*_b),
+        ], device=device, dtype=dtype)  # (3,) principal inertia moments
 
         self.agent_local_pos = torch.zeros(3, device=device, dtype=dtype)
         self.atanh_eps = Config.ATANH_EPSILON
@@ -434,6 +448,82 @@ class PhysicsEngine:
                 inertia_tensor=np.diag(I_diag),
             )
         return self._bodies[cid]
+
+    def _ensure_body_slot(self, creature) -> int:
+        """
+        Return (or lazily create) the persistent GPU tensor slot for this creature.
+        Cost per call: one dict lookup; tensor allocation only on first encounter.
+        """
+        cid = id(creature)
+        if cid in self._body_slots:
+            return self._body_slots[cid]
+
+        slot = self._next_slot
+        self._next_slot += 1
+        cap = max(self._next_slot, 4)
+
+        def _grow(t, cols):
+            if t is None or t.shape[0] < self._next_slot:
+                new = torch.zeros(cap, cols, device=self.device, dtype=self.dtype)
+                if t is not None:
+                    new[:t.shape[0]].copy_(t)
+                return new
+            return t
+
+        self._bp  = _grow(self._bp,  3)
+        self._blv = _grow(self._blv, 3)
+        self._bav = _grow(self._bav, 3)
+        self._bq  = _grow(self._bq,  4)
+
+        with torch.no_grad():
+            self._bp[slot].copy_(creature.pos)  # start at creature's current pos
+            self._bq[slot, 0] = 1.0             # identity quaternion (w=1)
+
+        self._body_slots[cid] = slot
+        return slot
+
+    def reset_body_state(self, creature):
+        """
+        Reset BOTH GPU body-state tensors and CPU RigidBody to match creature
+        after an episode reset (zero velocities, identity quaternion, position
+        from creature.pos).  Must be called whenever creature.pos is changed
+        outside normal stepping.
+
+        Without this the sequential fallback (_update_joint_dynamics_cpu)
+        carries stale position/velocity/orientation from the previous episode
+        into the first step of the new one, teleporting the creature and giving
+        it wrong initial dynamics.
+        """
+        cid = id(creature)
+
+        # -- GPU tensors (used by _step_batch_gpu) ----------------------------
+        if cid not in self._body_slots:
+            # First encounter: _ensure_body_slot already initialises from
+            # creature.pos with zero velocities and identity quat.
+            self._ensure_body_slot(creature)
+        else:
+            slot = self._body_slots[cid]
+            with torch.no_grad():
+                self._bp[slot].copy_(creature.pos)
+                self._blv[slot].zero_()
+                self._bav[slot].zero_()
+                self._bq[slot].zero_()
+                self._bq[slot, 0] = 1.0  # identity quaternion
+
+        # -- CPU RigidBody (used by _update_joint_dynamics_cpu / sequential) --
+        if cid in self._bodies:
+            body = self._bodies[cid]
+            body.pos[0] = float(creature.pos[0])
+            body.pos[1] = float(creature.pos[1])
+            body.pos[2] = float(creature.pos[2])
+            body.linear_vel[:] = 0.0
+            body.angular_vel[:] = 0.0
+            body.orientation.w = 1.0
+            body.orientation.x = 0.0
+            body.orientation.y = 0.0
+            body.orientation.z = 0.0
+            body.force_accum[:] = 0.0
+            body.torque_accum[:] = 0.0
 
     def apply_motor_torques(self, creature, motor_torques):
         """
@@ -918,11 +1008,12 @@ class PhysicsEngine:
         for i, creature in enumerate(creatures_batch):
             creature.foot_contact.copy_(contact_mask[i])
 
-        # Body z-velocity for each creature (needed for spring-damper damper term)
-        body_vz = torch.tensor(
-            [self._get_or_create_body(c).linear_vel[2] for c in creatures_batch],
-            device=self.device, dtype=self.dtype,
-        )  # (N,)
+        # Persistent GPU body-state slots: O(N) dict lookups, no NumPy
+        _slots = [self._ensure_body_slot(c) for c in creatures_batch]
+        _idx   = torch.tensor(_slots, device=self.device, dtype=torch.long)  # (N,)
+
+        # Body z-velocity for the spring-damper term (read from GPU tensor)
+        body_vz = self._blv[_idx, 2]  # (N,) – no NumPy round-trip
 
         penetrations = torch.clamp(self.ground_level - foot_z, min=0.0) * contact_mask  # (N, 4)
         spring       = self.contact_stiffness  * penetrations
@@ -941,51 +1032,108 @@ class PhysicsEngine:
             / torch.clamp(num_contacts, min=1.0)
         )  # (N,)
 
-        # ── 4. Per-creature rigid-body integration + reward ───────────────────
-        # RigidBody is NumPy-based; full tensor refactor is a separate task.
-        # This loop is now small: joint dynamics and FK have already been done above.
-        rewards_batch   = []
-        distances_batch = []
+        # ── 4. Batched rigid-body integration + reward (GPU) ─────────────────
+        # Replaces the NumPy/Numba per-creature for-loop with pure PyTorch ops,
+        # eliminating all CPU↔GPU round-trips and Python overhead on the hot path.
+        N   = num_envs
+        pos = self._bp[_idx].clone()   # (N, 3)
+        lv  = self._blv[_idx].clone()  # (N, 3)
+        av  = self._bav[_idx].clone()  # (N, 3)
+        q   = self._bq[_idx].clone()   # (N, 4)  [w, x, y, z]
 
+        # Net vertical force per creature
+        gravity_factor = 1.0 - torch.clamp(num_contacts, 0.0, 4.0) / 4.0  # (N,)
+        fz_net = contact_force_z - self.gravity * self._body_mass * gravity_factor  # (N,)
+        forces = torch.zeros(N, 3, device=self.device, dtype=self.dtype)
+        forces[:, 2] = fz_net
+
+        # Semi-implicit Euler: update velocity before position
+        lv  = lv  + forces * (1.0 / self._body_mass * self.dt)
+        pos = pos + lv * self.dt
+
+        # Quaternion → rotation matrix (N, 3, 3)
+        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        _z = torch.zeros(N, device=self.device, dtype=self.dtype)
+        _o = torch.ones( N, device=self.device, dtype=self.dtype)
+        R = torch.stack([
+            torch.stack([_o - 2*(qy*qy+qz*qz),  2*(qx*qy-qw*qz),        2*(qx*qz+qw*qy)],  dim=1),
+            torch.stack([2*(qx*qy+qw*qz),        _o - 2*(qx*qx+qz*qz),  2*(qy*qz-qw*qx)],  dim=1),
+            torch.stack([2*(qx*qz-qw*qy),        2*(qy*qz+qw*qx),        _o - 2*(qx*qx+qy*qy)], dim=1),
+        ], dim=1)  # (N, 3, 3)
+
+        # I_world = R @ diag(I) @ R^T  (scale columns of R, then bmm with R^T)
+        R_scaled = R * self._I_diag.view(1, 1, 3)          # (N, 3, 3)
+        I_world  = torch.bmm(R_scaled, R.transpose(1, 2))  # (N, 3, 3)
+
+        # Euler equations: I·α = −ω×(I·ω)  (no external body torques)
+        Iw    = torch.bmm(I_world, av.unsqueeze(-1)).squeeze(-1)  # (N, 3)
+        gyro  = torch.cross(av, Iw, dim=1)                        # (N, 3)
+        alpha = torch.linalg.solve(I_world, -gyro)                # (N, 3)
+        av    = av + alpha * self.dt
+
+        # Clamp angular velocity magnitude
+        av_mag = torch.norm(av, dim=1, keepdim=True).clamp(min=1e-6)
+        scale  = (self.max_angular_velocity / av_mag).clamp(max=1.0)
+        av     = av * scale
+
+        # Quaternion integration: q += 0.5·dt · (q ⊗ ω_pure)
+        half_dt = 0.5 * self.dt
+        ox, oy, oz = av[:, 0], av[:, 1], av[:, 2]
+        dw = half_dt * (-qx*ox - qy*oy - qz*oz)
+        dx = half_dt * ( qw*ox + qy*oz - qz*oy)
+        dy = half_dt * ( qw*oy - qx*oz + qz*ox)
+        dz = half_dt * ( qw*oz + qx*oy - qy*ox)
+        q  = torch.nn.functional.normalize(
+            q + torch.stack([dw, dx, dy, dz], dim=1), dim=1
+        )
+
+        # Quaternion → Euler angles (pitch, yaw, roll)
+        qw2, qx2, qy2, qz2 = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        sinr    = 2.0*(qw2*qx2 + qy2*qz2);  cosr = 1.0 - 2.0*(qx2*qx2 + qy2*qy2)
+        roll_b  = torch.atan2(sinr, cosr)
+        sinp    = torch.clamp(2.0*(qw2*qy2 - qz2*qx2), -1.0, 1.0)
+        pitch_b = torch.asin(sinp)
+        siny    = 2.0*(qw2*qz2 + qx2*qy2);  cosy = 1.0 - 2.0*(qy2*qy2 + qz2*qz2)
+        yaw_b   = torch.atan2(siny, cosy)
+
+        # Write back to persistent body-state tensors
+        self._bp[_idx]  = pos
+        self._blv[_idx] = lv
+        self._bav[_idx] = av
+        self._bq[_idx]  = q
+
+        # Scatter updated pos + orientation to creature tensors
         for i, creature in enumerate(creatures_batch):
-            body       = self._get_or_create_body(creature)
-            n_contacts = int(num_contacts[i].item())
-            fz         = float(contact_force_z[i].item())
+            creature.pos.copy_(pos[i])
+            creature.orientation[0] = pitch_b[i]
+            creature.orientation[1] = yaw_b[i]
+            creature.orientation[2] = roll_b[i]
 
-            gravity_factor = 1.0 - min(n_contacts, 4) / 4.0
-            body.add_force(np.array([0.0, 0.0, -self.gravity * body.mass * gravity_factor]))
-            body.add_force(np.array([0.0, 0.0, fz]))
-            body.integrate(self.dt, gravity=0)
+        # Batched reward (vectorised replica of compute_balance_reward)
+        balance_b = torch.exp(-0.5 * (pitch_b**2 + roll_b**2) / 0.01)  # 0.1²=0.01
+        contact_b = torch.clamp(num_contacts, 0.0, 4.0) * self.contact_reward
+        tilt_exc  = (torch.abs(pitch_b) > self.max_pitch_roll) | (torch.abs(roll_b) > self.max_pitch_roll)
+        stab_pen  = torch.where(
+            tilt_exc,
+            torch.full((N,), -self.tilt_penalty, device=self.device, dtype=self.dtype),
+            torch.zeros(N, device=self.device, dtype=self.dtype),
+        )
+        stab_fac  = torch.clamp(
+            1.0 - (torch.abs(pitch_b) + torch.abs(roll_b)) / (2.0 * self.max_pitch_roll),
+            min=0.0,
+        )
+        goal_xy      = goal_pos_batch[:, :2] - pos[:, :2]           # (N, 2) horizontal
+        com_dist     = torch.norm(goal_xy, dim=1)                    # (N,)
+        goal_rew     = torch.exp(-com_dist) * stab_fac
+        energy_b     = torch.norm(motor_torques_batch, dim=1) * self.energy_penalty
 
-            creature.pos.copy_(
-                torch.as_tensor(body.pos, device=self.device, dtype=self.dtype)
-            )
-            pitch, yaw, roll = body.orientation.to_euler()
-            creature.orientation[0] = float(pitch)
-            creature.orientation[1] = float(yaw)
-            creature.orientation[2] = float(roll)
-
-            reward, distance = self.compute_balance_reward(
-                creature.pos,
-                {
-                    'pitch'          : creature.orientation[0],
-                    'roll'           : creature.orientation[2],
-                    'num_contacts'   : n_contacts,
-                    'energy_consumed': 0.0,
-                },
-                motor_torques_batch[i],
-                goal_pos_batch[i],  # per-creature goal
-            )
-            rewards_batch.append(reward)
-            distances_batch.append(distance)
-
-        rewards_batch   = torch.stack(rewards_batch)
-        distances_batch = torch.stack(distances_batch)
+        rewards_batch   = balance_b + contact_b + stab_pen + goal_rew - energy_b
+        distances_batch = com_dist
 
         metrics_batch = {
             'num_contacts': num_contacts,
-            'pitch': torch.stack([c.orientation[0] for c in creatures_batch]),
-            'roll' : torch.stack([c.orientation[2] for c in creatures_batch]),
+            'pitch': pitch_b,
+            'roll' : roll_b,
         }
 
         return rewards_batch, distances_batch, metrics_batch

@@ -252,46 +252,38 @@ class TrainingEngine:
             num_actions=NN_NUM_ACTIONS,
         ).to(device)
 
-        # DataParallel for multi-GPU batch inference (forward() only).
-        # Special methods (forward_sequence, init_state, encoder, policy)
-        # are always accessed via self.model (the raw module).
-        n_gpus = torch.cuda.device_count()
-        self._n_gpus = n_gpus
-        if n_gpus > 1:
-            self._parallel_model = torch.nn.DataParallel(self.model)
-            logger.info(f"[Multi-GPU] DataParallel enabled across {n_gpus} GPUs")
-            print(f"[Multi-GPU] DataParallel enabled across {n_gpus} GPUs")
-        else:
-            self._parallel_model = self.model
-
         self.num_actions = NN_NUM_ACTIONS
-        
-        # PATTERN A: Pass SHARED encoder to WorldModel
-        # WorldModel will train the encoder offline on replay buffer
-        # PPOPolicy uses frozen encoder output
+
+        # Split compute across two GPUs when available:
+        #   GPU 0 (self.device):    policy inference + PPO training (EntityBelief)
+        #   GPU 1 (self.wm_device): world model training (encoder + dynamics heads)
+        # DataParallel on the tiny EntityBelief (obs=34 → hidden=256) is NOT used;
+        # its per-step forward pass is too small to amortise DP synchronisation cost.
+        self.wm_device = torch.device("cuda:1") if torch.cuda.device_count() > 1 else device
+        if self.wm_device != device:
+            logger.info("[Multi-GPU] EntityBelief on cuda:0, WorldModel on cuda:1")
+            print("[Multi-GPU] EntityBelief on cuda:0, WorldModel on cuda:1")
+
+        # PATTERN A: WorldModel owns its own encoder on wm_device.
+        # After each world model update, encoder weights are synced back to the
+        # policy's frozen encoder via cross-device copy (see train_world_model).
         self.world_model = WorldModel(
             obs_dim=NN_OBS_DIM,
             action_dim=NN_NUM_ACTIONS,
             latent_dim=Config.EMBED_DIM,
             hidden_dim=Config.WORLD_MODEL_HIDDEN_DIM,
-            encoder=self.model.encoder  # SHARED
-        ).to(device)
-        
+            encoder=None,  # own encoder on wm_device, synced back after each update
+        ).to(self.wm_device)
+
         # Optimizers
-        # IMPORTANT: Compare by identity (id) not tensor equality
-        # Only encoder and world_model_params in world_model_optimizer
-        # PPO optimizer only updates policy parameters (not encoder)
-        encoder_params = list(self.model.encoder.parameters())
-        encoder_param_ids = {id(p) for p in encoder_params}
-        world_model_only_params = [p for p in self.world_model.parameters() if id(p) not in encoder_param_ids]
-        
+        # world_model_optimizer owns the full world model (including its encoder)
         self.world_model_optimizer = torch.optim.Adam(
-            encoder_params + world_model_only_params,
+            self.world_model.parameters(),
             lr=Config.WORLD_MODEL_LR,
             weight_decay=Config.WORLD_MODEL_WEIGHT_DECAY
         )
         
-        # PPO optimizer only touches policy parameters (frozen encoder)
+        # PPO optimizer only touches policy parameters (encoder is frozen in EntityBelief)
         ppo_params = [p for p in self.model.policy.parameters()]
         self.optimizer = torch.optim.Adam(ppo_params, lr=Config.LR)
         
@@ -343,14 +335,7 @@ class TrainingEngine:
             logger.error(f"Failed to save checkpoint: {e}")
     
     def _run_model(self, obs, edge_idx, prev_state):
-        """
-        Model forward pass that uses DataParallel only when the batch is large
-        enough to be split.  Falls back to the raw module for small batches
-        (e.g. single-sample bootstrap steps) to avoid DataParallel's
-        'sub-batch of size 0 on GPU N' error when batch_size < num_gpus.
-        """
-        if self._n_gpus > 1 and obs.shape[0] >= self._n_gpus:
-            return self._parallel_model(obs, edge_idx, prev_state=prev_state)
+        """Policy forward pass – always on self.device (cuda:0)."""
         return self.model(obs, edge_idx, prev_state=prev_state)
 
     def load_checkpoint(self):
@@ -402,6 +387,7 @@ class TrainingEngine:
             h0, c0 = self.model.init_state(1, self.device, self.dtype)
             creature.rnn_state = (h0, c0)
             self.env.spawn_random_goal(env_id)
+            self.physics.reset_body_state(creature)  # sync GPU body state after reset
         
         # Main loop: run all environments until they all reach max_steps
         for global_step in range(max_steps):
@@ -620,6 +606,12 @@ class TrainingEngine:
         creature.joint_velocities = torch.zeros(12, dtype=self.dtype, device=self.device)
         creature.foot_contact = torch.ones(4, dtype=self.dtype, device=self.device)
         
+        # Reset both GPU body-state tensors and CPU RigidBody so that the
+        # sequential physics path (_update_joint_dynamics_cpu) starts the new
+        # episode from the correct position with zero velocity, not the stale
+        # state left over from the end of the previous episode.
+        self.physics.reset_body_state(creature)
+
         # Reset RNN state
         h0, c0 = self.model.init_state(1, self.device, self.dtype)
         creature.rnn_state = (h0, c0)
@@ -708,10 +700,10 @@ class TrainingEngine:
             return
         
         # ============ DREAMER TRAINING (off-policy on replay buffer) ============
-        self.unfreeze_encoder()  # Allow encoder to be updated
+        # WorldModel trains its own encoder on wm_device and syncs weights back
+        # to the frozen policy encoder via cross-device copy in train_world_model.
         wm_loss = self.train_world_model(trajectory)
         logger.info(f"  [Dreamer] World Model Loss: {wm_loss:.4f}")
-        self.freeze_encoder()  # Re-freeze for PPO
         
         # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
@@ -802,7 +794,7 @@ class TrainingEngine:
         msg = f"Ep {self.episode_count}: reward={episode_reward:.2f}, policy_loss={policy_loss.item():.4f}, value_loss={value_loss.item():.4f}, entropy={entropy.item():.4f}, KL={kl.item():.4f}, clip={clip_frac.item():.4f}, action_clamp={clamp_frac:.2%}"
         logger.info(msg)
         logger.info(f"  Actions: mean={action_mean.mean().item():.3f}, std={action_std.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}")
-        logger.info(f"  Contacts: {mean_contacts.tolist()} | All4 Freq: {all_4_freq.item():.2%}")
+        logger.info(f"  Contacts: {mean_contacts.tolist()} | All 4 Freq: {all_4_freq.item():.2%}")
         print(msg)
     
     def train_on_trajectories_batch(self, trajectories_wrapped):
@@ -832,14 +824,13 @@ class TrainingEngine:
             logger.info(f"  Traj {i} (env_id={traj_data['env_id']}): len={len(traj)}, total_reward={traj_reward:.2f}")
         
         # ============ DREAMER TRAINING (off-policy on replay buffer) ============
-        self.unfreeze_encoder()  # Allow encoder to be updated
+        # WorldModel trains its own encoder on wm_device; weights synced in train_world_model.
         total_wm_loss = 0.0
         for traj_data in trajectories_wrapped:
             wm_loss = self.train_world_model(traj_data['trajectory'])
             total_wm_loss += wm_loss
         avg_wm_loss = total_wm_loss / len(trajectories_wrapped)
         logger.info(f"  [Dreamer] Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)")
-        self.freeze_encoder()  # Re-freeze for PPO
         
         # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
@@ -907,27 +898,34 @@ class TrainingEngine:
         advantages_raw = torch.cat(all_advantages_raw)
         returns_batch  = torch.cat(all_returns)
         advantages_batch = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
-        
-        # Debug: log shapes and value ranges
-        logger.info(f"[SHAPES] advantages_batch: {advantages_batch.shape}, min={advantages_batch.min():.4f}, max={advantages_batch.max():.4f}")
-        logger.info(f"[SHAPES] returns_batch: {returns_batch.shape}, min={returns_batch.min():.4f}, max={returns_batch.max():.4f}")
-        logger.info(f"[SHAPES] old_log_probs_batch: {old_log_probs_batch.shape}, min={old_log_probs_batch.min():.4f}, max={old_log_probs_batch.max():.4f}")
-        logger.info(f"[SHAPES] values_batch: {values_batch.shape}, min={values_batch.min():.4f}, max={values_batch.max():.4f}")
-        logger.info(f"[SHAPES] next_values_batch: {next_values_batch.shape}, min={next_values_batch.min():.4f}, max={next_values_batch.max():.4f}")
-        
+
+        # Precompute obs tensors and action_batch once – observations and actions
+        # are fixed across PPO epochs; only the model forward pass changes.
+        obs_seqs = []   # one (T, obs_dim) tensor per trajectory
+        traj_lengths = []
+        step_offset = 0
+        for obs_list_t in all_obs:
+            T_traj = len(obs_list_t)
+            obs_seqs.append(torch.cat(obs_list_t, dim=0))  # (T, obs_dim)
+            traj_lengths.append(T_traj)
+            step_offset += T_traj
+
+        all_actions_flat = []
+        for action_list in all_actions:
+            all_actions_flat.extend(action_list)
+        action_batch = torch.cat(all_actions_flat, dim=0)  # (total_T, 12)
+
         total_policy_loss = 0.0
         total_value_loss = 0.0
-        
+
         for epoch in range(Config.PPO_EPOCHS):
             with torch.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
                 # Batch encoder across all T steps per trajectory (one big matmul)
                 # instead of T × num_envs × PPO_EPOCHS separate (1, obs) calls.
-                # E.g. T=1024, 16 envs, 4 epochs: was 65 536 calls → now 64.
+                # E.g. T=512, 32 envs, 10 epochs: was 163 840 calls → now 320.
                 all_mus, all_log_stds, all_vals_epoch = [], [], []
                 step_offset = 0
-                for traj_idx, obs_list_t in enumerate(all_obs):
-                    T_traj  = len(obs_list_t)
-                    obs_seq = torch.cat(obs_list_t, dim=0)           # (T, obs_dim)
+                for obs_seq, T_traj in zip(obs_seqs, traj_lengths):
                     t_dones = dones_batch[step_offset:step_offset + T_traj]
                     (mu_t, log_std_t), val_t, _ = self.model.forward_sequence(
                         obs_seq, dones=t_dones
@@ -941,11 +939,6 @@ class TrainingEngine:
                 log_std_seq = torch.cat(all_log_stds, dim=0)
                 value_seq   = torch.cat(all_vals_epoch, dim=0)
 
-                all_actions_flat = []
-                for action_list in all_actions:
-                    all_actions_flat.extend(action_list)
-                action_batch = torch.cat(all_actions_flat, dim=0)
-                
                 mu = mu_seq
                 std = torch.exp(log_std_seq)
                 
@@ -1037,13 +1030,19 @@ class TrainingEngine:
                 batch_next_obs.append(nxt)
                 batch_rewards.append(trajectory[i]['reward'].unsqueeze(0))
             
-            obs_batch = torch.cat(batch_obs, dim=0)
-            actions_batch = torch.cat(batch_actions, dim=0)
-            rewards_batch = torch.cat(batch_rewards, dim=0).squeeze(-1)  # Shape: [32]
+            obs_batch      = torch.cat(batch_obs,      dim=0).to(self.wm_device)
+            actions_batch  = torch.cat(batch_actions,  dim=0).to(self.wm_device)
+            # next_obs_batch: the reconstruction target for decode(next_latent).
+            # batch_next_obs was collected but never materialised into a tensor —
+            # using obs_batch as the target would train the decoder to map the
+            # *next* latent back to the *current* observation, a contradictory signal.
+            next_obs_batch = torch.cat(batch_next_obs, dim=0).to(self.wm_device)
+            rewards_batch  = torch.cat(batch_rewards,  dim=0).squeeze(-1).to(self.wm_device)
             
             next_latent, pred_rewards, pred_dones, recon_obs = self.world_model(obs_batch, actions_batch)
             
-            recon_loss = torch.nn.functional.mse_loss(recon_obs, obs_batch)
+            # recon_obs = decode(next_latent) → should match next observation
+            recon_loss = torch.nn.functional.mse_loss(recon_obs, next_obs_batch)
             reward_loss = torch.nn.functional.mse_loss(pred_rewards.squeeze(-1), rewards_batch)
             wm_loss = recon_loss + reward_loss
             
@@ -1051,7 +1050,14 @@ class TrainingEngine:
             wm_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
             self.world_model_optimizer.step()
-            
+            # Sync world-model encoder (wm_device) → policy encoder (device).
+            # Keeps the frozen policy encoder up to date with representation learning.
+            if self.wm_device != self.device:
+                with torch.no_grad():
+                    for p_src, p_dst in zip(self.world_model.encoder.parameters(),
+                                             self.model.encoder.parameters()):
+                        p_dst.data.copy_(p_src.data)
+
             total_loss += wm_loss.detach().item()
         
         return total_loss / num_batches
@@ -1063,7 +1069,17 @@ class System:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float32
-        
+
+        # Eagerly initialize CUDA contexts on all visible GPUs before any model
+        # or cuBLAS work.  Without this PyTorch lazily creates the context on the
+        # first op, which causes the "no current CUDA context" / cuBLAS warning
+        # when DataParallel dispatches to GPU 1 before GPU 0's context exists.
+        if self.device.type == "cuda":
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.init()
+                    torch.zeros(1, device=f"cuda:{i}")  # forces context creation
+
         # Initialize components
         self.env = Environment(self.device, self.dtype)
         self.physics = PhysicsEngine(self.device, self.dtype, self.env)
