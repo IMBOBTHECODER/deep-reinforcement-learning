@@ -703,7 +703,9 @@ class TrainingEngine:
         # WorldModel trains its own encoder on wm_device and syncs weights back
         # to the frozen policy encoder via cross-device copy in train_world_model.
         wm_loss = self.train_world_model(trajectory)
-        logger.info(f"  [Dreamer] World Model Loss: {wm_loss:.4f}")
+        wm_msg = f"  [Dreamer] World Model Loss: {wm_loss:.4f}"
+        logger.info(wm_msg)
+        print(wm_msg)
         
         # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
@@ -792,10 +794,14 @@ class TrainingEngine:
         episode_reward = sum(float(t['reward']) for t in trajectory)
         self.episode_rewards.append(episode_reward)
         msg = f"Ep {self.episode_count}: reward={episode_reward:.2f}, policy_loss={policy_loss.item():.4f}, value_loss={value_loss.item():.4f}, entropy={entropy.item():.4f}, KL={kl.item():.4f}, clip={clip_frac.item():.4f}, action_clamp={clamp_frac:.2%}"
+        diag_actions  = f"  Actions: mean={action_mean.mean().item():.3f}, std={action_std.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}"
+        diag_contacts = f"  Contacts: {mean_contacts.tolist()} | All 4 Freq: {all_4_freq.item():.2%}"
         logger.info(msg)
-        logger.info(f"  Actions: mean={action_mean.mean().item():.3f}, std={action_std.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}")
-        logger.info(f"  Contacts: {mean_contacts.tolist()} | All 4 Freq: {all_4_freq.item():.2%}")
+        logger.info(diag_actions)
+        logger.info(diag_contacts)
         print(msg)
+        print(diag_actions)
+        print(diag_contacts)
     
     def train_on_trajectories_batch(self, trajectories_wrapped):
         """Train on multiple trajectories from vectorized environments.
@@ -830,7 +836,9 @@ class TrainingEngine:
             wm_loss = self.train_world_model(traj_data['trajectory'])
             total_wm_loss += wm_loss
         avg_wm_loss = total_wm_loss / len(trajectories_wrapped)
-        logger.info(f"  [Dreamer] Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)")
+        wm_batch_msg = f"  [Dreamer] Batch World Model Loss: {avg_wm_loss:.4f} ({len(trajectories_wrapped)} envs)"
+        logger.info(wm_batch_msg)
+        print(wm_batch_msg)
         
         # ============ PPO TRAINING (on-policy with frozen encoder) ============
         
@@ -996,10 +1004,14 @@ class TrainingEngine:
         
         # Log debugging info
         msg = f"Batch Ep {self.episode_count}: avg_reward={batch_reward:.2f}, policy_loss={total_policy_loss/Config.PPO_EPOCHS:.4f}, value_loss={total_value_loss/Config.PPO_EPOCHS:.4f}, entropy={entropy.item():.4f}, KL={kl.item():.4f}, clip={clip_frac.item():.4f}, action_clamp={clamp_frac:.2%}"
+        diag_actions  = f"  Actions: mean={action_mean_per_joint.mean().item():.3f}, std={action_std_per_joint.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}"
+        diag_contacts = f"  Contacts: {mean_contacts.tolist()} | All 4 Freq: {all_4_freq.item():.2%}"
         logger.info(msg)
-        logger.info(f"  Actions: mean={action_mean_per_joint.mean().item():.3f}, std={action_std_per_joint.mean().item():.3f} | Sat Rate: {sat_rate.item():.2%}")
-        logger.info(f"  Contacts: {mean_contacts.tolist()} | All4 Freq: {all_4_freq.item():.2%}")
+        logger.info(diag_actions)
+        logger.info(diag_contacts)
         print(msg)
+        print(diag_actions)
+        print(diag_contacts)
     
     def train_world_model(self, trajectory):
         """Train world model on trajectory."""
@@ -1113,7 +1125,9 @@ class System:
                 if self.env.use_vectorized:
                     # Parallel trajectory collection across all environments
                     trajectories_batch = self.training.collect_trajectories_vectorized(max_steps=Config.MAX_STEPS_PER_EPISODE)
-                    logger.info(f"Collected {len(trajectories_batch)} trajectories in parallel")
+                    collect_msg = f"Collected {len(trajectories_batch)} trajectories in parallel"
+                    logger.info(collect_msg)
+                    print(collect_msg)
                     
                     # Train once per batch
                     if trajectories_batch and any(trajectories_batch):
